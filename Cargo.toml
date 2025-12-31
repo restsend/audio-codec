@@ -1,0 +1,28 @@
+[package]
+name = "audio-codec"
+version = "0.3.29"
+edition = "2024"
+authors = ["jinti<shenjindi@fourz.cn>"]
+description = "A voip audio codecs engine in Rust"
+license = "MIT"
+repository = "https://github.com/restsend/audio-codec"
+readme = "README.md"
+keywords = ["sip", "voip", "telephony", "webrtc"]
+categories = ["multimedia"]
+
+[features]
+opus = ["dep:opusic-sys"]
+default = ["opus"]
+not_vad = []
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+anyhow = "1"
+g729-sys = "0.1.2"
+opusic-sys = { version = "0.5.8", optional = true }
+
+[dev-dependencies]
+hound = "3.5.1"
+clap = { version = "4.5", features = ["derive"] }
