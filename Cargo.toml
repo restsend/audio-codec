@@ -1,6 +1,6 @@
 [package]
 name = "audio-codec"
-version = "0.3.29"
+version = "0.3.30"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A collection of VoIP audio codecs in Rust, including G.711, G.722, G.729, and Opus."
@@ -12,8 +12,8 @@ categories = ["multimedia"]
 
 [features]
 opus = ["dep:opusic-sys"]
+opus_mono = ["opus", "dep:opusic-sys"]
 default = ["opus"]
-not_vad = []
 
 [lib]
 crate-type = ["rlib"]
@@ -26,3 +26,8 @@ opusic-sys = { version = "0.5.8", optional = true }
 [dev-dependencies]
 hound = "3.5.1"
 clap = { version = "4.5", features = ["derive"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "codec_bench"
+harness = false

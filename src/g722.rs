@@ -1,4 +1,5 @@
 use super::{Decoder, Encoder, PcmBuf, Sample};
+
 pub enum Bitrate {
     Mode1_64000,
     Mode2_56000,
@@ -109,14 +110,13 @@ struct G722Band {
     zero_coefficients: [i32; 7],
     /// Temporary zero filter coefficients [unused(0), b1', b2', ..., b6']
     zero_coefficients_temp: [i32; 7],
-    /// Sign bits storage [current signal, previous, ..., previous-5]
-    sign_bits: [i32; 7],
     /// Log scale factor (used for quantization and dequantization)
     log_scale_factor: i32,
     /// Quantizer step size (used for adaptive quantization)
     quantizer_step_size: i32,
 }
 
+#[inline(always)]
 fn saturate(amp: i32) -> i32 {
     amp.clamp(i16::MIN as i32, i16::MAX as i32)
 }
@@ -124,129 +124,104 @@ fn saturate(amp: i32) -> i32 {
 /// Process Block 4 operations for G.722 ADPCM algorithm
 /// This function performs the predictor adaptation and reconstruction steps
 /// as defined in the G.722 standard
+#[inline]
 fn block4(band: &mut G722Band, d: i32) {
     // Block 4, RECONS - Reconstruct the signal
-    // Set current prediction difference
     band.difference_signal[0] = d;
-    // Reconstruct signal by adding signal estimate to difference signal
     band.reconstructed_signal[0] = saturate(band.signal_estimate + d);
 
     // Block 4, PARREC - Partial reconstruction
-    // Used for predictor adaptation
-    band.partial_reconstructed[0] = saturate(band.zero_filter_output + d);
+    let partial_rec0 = saturate(band.zero_filter_output + d);
+    band.partial_reconstructed[0] = partial_rec0;
 
     // Block 4, UPPOL2 - Update second predictor coefficient
-    // Extract sign bits for adaptation logic
-    band.sign_bits[0] = band.partial_reconstructed[0] >> 15;
-    band.sign_bits[1] = band.partial_reconstructed[1] >> 15;
-    band.sign_bits[2] = band.partial_reconstructed[2] >> 15;
+    let s0 = partial_rec0 >> 15;
+    let s1 = band.partial_reconstructed[1] >> 15;
+    let s2 = band.partial_reconstructed[2] >> 15;
 
-    // Scale first predictor coefficient
     let a1_scaled = saturate(band.pole_coefficients[1] << 2);
 
-    // Apply sign correlation logic for adaptation direction
-    let mut a2_update = if band.sign_bits[0] == band.sign_bits[1] {
-        -a1_scaled
-    } else {
-        a1_scaled
-    };
+    let mut a2_update = if s0 == s1 { -a1_scaled } else { a1_scaled };
     a2_update = a2_update.min(32767);
 
-    // Apply second level of adaptation based on older samples
     let mut a2_adj = a2_update >> 7;
-    if band.sign_bits[0] == band.sign_bits[2] {
-        a2_adj += 128;
-    } else {
-        a2_adj -= 128;
-    }
-
-    // Complete second coefficient update with leakage factor
+    a2_adj += if s0 == s2 { 128 } else { -128 };
     a2_adj += (band.pole_coefficients[2] * 32512) >> 15;
 
-    // Limit the coefficient range to prevent instability
     band.pole_coefficients_temp[2] = a2_adj.clamp(-12288, 12288);
 
     // Block 4, UPPOL1 - Update first predictor coefficient
-    band.sign_bits[0] = band.partial_reconstructed[0] >> 15; // Current sign
-    band.sign_bits[1] = band.partial_reconstructed[1] >> 15; // Previous sign
-
-    // Apply sign correlation logic for first coefficient
-    let sign_factor = if band.sign_bits[0] == band.sign_bits[1] {
-        192
-    } else {
-        -192
-    };
+    let sign_factor = if s0 == s1 { 192 } else { -192 };
     let leakage = (band.pole_coefficients[1] * 32640) >> 15;
-
-    // Calculate new coefficient with both sign and leakage factors
     band.pole_coefficients_temp[1] = saturate(sign_factor + leakage);
 
-    // Calculate adjustment limit based on second coefficient
     let limit = saturate(15360 - band.pole_coefficients_temp[2]);
-
-    // Constrain first coefficient based on second coefficient
-    // This prevents instability in the filter
-    if band.pole_coefficients_temp[1] > limit {
-        band.pole_coefficients_temp[1] = limit;
-    } else if band.pole_coefficients_temp[1] < -limit {
-        band.pole_coefficients_temp[1] = -limit;
-    }
+    band.pole_coefficients_temp[1] = band.pole_coefficients_temp[1].clamp(-limit, limit);
 
     // Block 4, UPZERO - Update zero section (FIR) coefficients
     let step_size = if d == 0 { 0 } else { 128 };
-    band.sign_bits[0] = d >> 15; // Sign of current difference
+    let sd = d >> 15;
 
-    // Update each zero filter coefficient
-    for i in 1..7 {
-        band.sign_bits[i] = band.difference_signal[i] >> 15; // Extract sign
-        // Apply sign correlation logic for adaptation direction
-        let adj = if band.sign_bits[i] == band.sign_bits[0] {
-            step_size
-        } else {
-            -step_size
-        };
-        // Apply leakage factor
-        let leakage = (band.zero_coefficients[i] * 32640) >> 15;
-        // Calculate new coefficient
-        band.zero_coefficients_temp[i] = saturate(adj + leakage);
+    {
+        macro_rules! update_zero {
+            ($i:expr) => {
+                let sz = band.difference_signal[$i] >> 15;
+                let adj = if sz == sd { step_size } else { -step_size };
+                let leakage = (band.zero_coefficients[$i] * 32640) >> 15;
+                band.zero_coefficients_temp[$i] = saturate(adj + leakage);
+            };
+        }
+        update_zero!(1);
+        update_zero!(2);
+        update_zero!(3);
+        update_zero!(4);
+        update_zero!(5);
+        update_zero!(6);
     }
 
     // Block 4, DELAYA - Delay updates for filter memory
-    // Shift the difference signal memory
-    band.difference_signal.copy_within(0..6, 1);
+    band.difference_signal[6] = band.difference_signal[5];
+    band.difference_signal[5] = band.difference_signal[4];
+    band.difference_signal[4] = band.difference_signal[3];
+    band.difference_signal[3] = band.difference_signal[2];
+    band.difference_signal[2] = band.difference_signal[1];
+    band.difference_signal[1] = d;
 
-    // Update filter coefficients
-    band.zero_coefficients
-        .copy_from_slice(&band.zero_coefficients_temp);
+    band.zero_coefficients[1] = band.zero_coefficients_temp[1];
+    band.zero_coefficients[2] = band.zero_coefficients_temp[2];
+    band.zero_coefficients[3] = band.zero_coefficients_temp[3];
+    band.zero_coefficients[4] = band.zero_coefficients_temp[4];
+    band.zero_coefficients[5] = band.zero_coefficients_temp[5];
+    band.zero_coefficients[6] = band.zero_coefficients_temp[6];
 
-    // Shift pole filter memory
-    band.reconstructed_signal.copy_within(0..2, 1);
-    band.partial_reconstructed.copy_within(0..2, 1);
+    band.reconstructed_signal[2] = band.reconstructed_signal[1];
+    band.reconstructed_signal[1] = band.reconstructed_signal[0];
+    band.partial_reconstructed[2] = band.partial_reconstructed[1];
+    band.partial_reconstructed[1] = partial_rec0;
+
     band.pole_coefficients[1] = band.pole_coefficients_temp[1];
     band.pole_coefficients[2] = band.pole_coefficients_temp[2];
 
     // Block 4, FILTEP - Pole section (IIR) filtering
-    // Calculate contribution of the pole section to the signal estimate
-    let r1_adj = saturate(band.reconstructed_signal[1] << 1); // Scale by 2
+    let r1_adj = saturate(band.reconstructed_signal[1] << 1);
     let pole1 = (band.pole_coefficients[1] * r1_adj) >> 15;
 
-    let r2_adj = saturate(band.reconstructed_signal[2] << 1); // Scale by 2
+    let r2_adj = saturate(band.reconstructed_signal[2] << 1);
     let pole2 = (band.pole_coefficients[2] * r2_adj) >> 15;
 
-    // Combined pole section output
     band.pole_filter_output = saturate(pole1 + pole2);
 
     // Block 4, FILTEZ - Zero section (FIR) filtering
-    // Calculate contribution of the zero section to the signal estimate
-    band.zero_filter_output = 0;
-    for i in 1..7 {
-        let d_adj = saturate(band.difference_signal[i] << 1); // Scale by 2
-        band.zero_filter_output += (band.zero_coefficients[i] * d_adj) >> 15;
-    }
-    band.zero_filter_output = saturate(band.zero_filter_output);
+    let mut zero_out = (band.zero_coefficients[1] * saturate(band.difference_signal[1] << 1)) >> 15;
+    zero_out += (band.zero_coefficients[2] * saturate(band.difference_signal[2] << 1)) >> 15;
+    zero_out += (band.zero_coefficients[3] * saturate(band.difference_signal[3] << 1)) >> 15;
+    zero_out += (band.zero_coefficients[4] * saturate(band.difference_signal[4] << 1)) >> 15;
+    zero_out += (band.zero_coefficients[5] * saturate(band.difference_signal[5] << 1)) >> 15;
+    zero_out += (band.zero_coefficients[6] * saturate(band.difference_signal[6] << 1)) >> 15;
+
+    band.zero_filter_output = saturate(zero_out);
 
     // Block 4, PREDIC - Prediction
-    // Final signal estimate is sum of pole and zero section outputs
     band.signal_estimate = saturate(band.pole_filter_output + band.zero_filter_output);
 }
 
@@ -300,59 +275,111 @@ impl G722Encoder {
         // Pre-allocate output buffer with appropriate capacity
         let mut output = Vec::with_capacity(amp.len() / 2 + 1);
 
-        // Initialize processing variables for low and high bands
-        let mut xlow: i32;
-        let mut xhigh: i32 = 0;
+        // Initialize processing variables
         let mut input_idx = 0;
 
-        // Process all input samples
-        while input_idx < amp.len() {
-            // Split input into low and high bands based on mode
-            if self.eight_k {
+        if self.eight_k {
+            while input_idx < amp.len() {
                 // 8kHz mode - Just use input directly with scaling
-                xlow = amp[input_idx] as i32 >> 1;
+                let xlow = amp[input_idx] as i32 >> 1;
                 input_idx += 1;
-            } else {
-                // 16kHz mode - Apply QMF analysis filter to split bands
+
+                // 8kHz mode - only low band matters
+                let code = self.encode_low_band(xlow, true);
+                self.output_code(code, &mut output);
+            }
+        } else {
+            // Process all input samples in 16kHz mode
+            // Use chunks_exact(2) for better performance and to avoid bound checks
+            let chunks = amp.chunks_exact(2);
+            let rem = chunks.remainder();
+
+            for chunk in chunks {
                 // Shuffle buffer down to make room for new samples
                 self.x.copy_within(2..24, 0);
 
                 // Add new samples to buffer
-                self.x[22] = amp[input_idx] as i32;
-                input_idx += 1;
-                self.x[23] = if input_idx < amp.len() {
-                    amp[input_idx] as i32
-                } else {
-                    0 // Handle edge case at end of buffer
-                };
-                input_idx += 1;
+                self.x[22] = chunk[0] as i32;
+                self.x[23] = chunk[1] as i32;
 
                 // Apply QMF filter to split input into bands
-                let mut sumeven = 0;
-                let mut sumodd = 0;
-                for i in 0..12 {
-                    sumodd += self.x[2 * i] * QMF_FILTER_COEFS[i];
-                    sumeven += self.x[2 * i + 1] * QMF_FILTER_COEFS[11 - i];
-                }
+                // Unrolled loop for 12 coefficients
+                let mut sumodd = self.x[0] * QMF_FILTER_COEFS[0];
+                sumodd += self.x[2] * QMF_FILTER_COEFS[1];
+                sumodd += self.x[4] * QMF_FILTER_COEFS[2];
+                sumodd += self.x[6] * QMF_FILTER_COEFS[3];
+                sumodd += self.x[8] * QMF_FILTER_COEFS[4];
+                sumodd += self.x[10] * QMF_FILTER_COEFS[5];
+                sumodd += self.x[12] * QMF_FILTER_COEFS[6];
+                sumodd += self.x[14] * QMF_FILTER_COEFS[7];
+                sumodd += self.x[16] * QMF_FILTER_COEFS[8];
+                sumodd += self.x[18] * QMF_FILTER_COEFS[9];
+                sumodd += self.x[20] * QMF_FILTER_COEFS[10];
+                sumodd += self.x[22] * QMF_FILTER_COEFS[11];
+
+                let mut sumeven = self.x[1] * QMF_FILTER_COEFS[11];
+                sumeven += self.x[3] * QMF_FILTER_COEFS[10];
+                sumeven += self.x[5] * QMF_FILTER_COEFS[9];
+                sumeven += self.x[7] * QMF_FILTER_COEFS[8];
+                sumeven += self.x[9] * QMF_FILTER_COEFS[7];
+                sumeven += self.x[11] * QMF_FILTER_COEFS[6];
+                sumeven += self.x[13] * QMF_FILTER_COEFS[5];
+                sumeven += self.x[15] * QMF_FILTER_COEFS[4];
+                sumeven += self.x[17] * QMF_FILTER_COEFS[3];
+                sumeven += self.x[19] * QMF_FILTER_COEFS[2];
+                sumeven += self.x[21] * QMF_FILTER_COEFS[1];
+                sumeven += self.x[23] * QMF_FILTER_COEFS[0];
 
                 // Scale filter outputs to get low and high bands
-                xlow = (sumeven + sumodd) >> 14;
-                xhigh = (sumeven - sumodd) >> 14;
-            }
+                let xlow = (sumeven + sumodd) >> 14;
+                let xhigh = (sumeven - sumodd) >> 14;
 
-            // Process low band (always performed)
-            let code = if self.eight_k {
-                // 8kHz mode - only low band matters
-                self.encode_low_band(xlow, true)
-            } else {
                 // 16kHz mode - encode both bands
                 let ilow = self.encode_low_band(xlow, false);
                 let ihigh = self.encode_high_band(xhigh);
-                (ihigh << 6 | ilow) >> (8 - self.bits_per_sample)
-            };
+                let code = (ihigh << 6 | ilow) >> (8 - self.bits_per_sample);
 
-            // Output the encoded code
-            self.output_code(code, &mut output);
+                // Output the encoded code
+                self.output_code(code, &mut output);
+            }
+
+            if !rem.is_empty() {
+                self.x.copy_within(2..24, 0);
+                self.x[22] = rem[0] as i32;
+                self.x[23] = 0;
+                let mut sumodd = self.x[0] * QMF_FILTER_COEFS[0];
+                sumodd += self.x[2] * QMF_FILTER_COEFS[1];
+                sumodd += self.x[4] * QMF_FILTER_COEFS[2];
+                sumodd += self.x[6] * QMF_FILTER_COEFS[3];
+                sumodd += self.x[8] * QMF_FILTER_COEFS[4];
+                sumodd += self.x[10] * QMF_FILTER_COEFS[5];
+                sumodd += self.x[12] * QMF_FILTER_COEFS[6];
+                sumodd += self.x[14] * QMF_FILTER_COEFS[7];
+                sumodd += self.x[16] * QMF_FILTER_COEFS[8];
+                sumodd += self.x[18] * QMF_FILTER_COEFS[9];
+                sumodd += self.x[20] * QMF_FILTER_COEFS[10];
+                sumodd += self.x[22] * QMF_FILTER_COEFS[11];
+
+                let mut sumeven = self.x[1] * QMF_FILTER_COEFS[11];
+                sumeven += self.x[3] * QMF_FILTER_COEFS[10];
+                sumeven += self.x[5] * QMF_FILTER_COEFS[9];
+                sumeven += self.x[7] * QMF_FILTER_COEFS[8];
+                sumeven += self.x[9] * QMF_FILTER_COEFS[7];
+                sumeven += self.x[11] * QMF_FILTER_COEFS[6];
+                sumeven += self.x[13] * QMF_FILTER_COEFS[5];
+                sumeven += self.x[15] * QMF_FILTER_COEFS[4];
+                sumeven += self.x[17] * QMF_FILTER_COEFS[3];
+                sumeven += self.x[19] * QMF_FILTER_COEFS[2];
+                sumeven += self.x[21] * QMF_FILTER_COEFS[1];
+                sumeven += self.x[23] * QMF_FILTER_COEFS[0];
+
+                let xlow = (sumeven + sumodd) >> 14;
+                let xhigh = (sumeven - sumodd) >> 14;
+                let ilow = self.encode_low_band(xlow, false);
+                let ihigh = self.encode_high_band(xhigh);
+                let code = (ihigh << 6 | ilow) >> (8 - self.bits_per_sample);
+                self.output_code(code, &mut output);
+            }
         }
 
         // Handle any remaining bits in the output buffer
@@ -365,18 +392,19 @@ impl G722Encoder {
 
     /// Encode low band sample and update state
     /// Returns the encoded low band bits
+    #[inline]
     fn encode_low_band(&mut self, xlow: i32, is_eight_k: bool) -> i32 {
         // Block 1L, SUBTRA - Calculate difference signal
         let el = saturate(xlow - self.band[0].signal_estimate);
 
         // Block 1L, QUANTL - Quantize difference signal
-        let wd = if el >= 0 { el } else { -(el + 1) };
+        let wd = el.abs().wrapping_sub((el >> 31) & 1);
 
-        // Find quantization interval
+        // Find quantization interval using linear search (more predictable for audio)
+        let lsf = self.band[0].log_scale_factor;
         let mut quantization_idx = 1;
         while quantization_idx < 30 {
-            let decision_level =
-                (QUANT_DECISION_LEVEL[quantization_idx] * self.band[0].log_scale_factor) >> 12;
+            let decision_level = (QUANT_DECISION_LEVEL[quantization_idx] * lsf) >> 12;
             if wd < decision_level {
                 break;
             }
@@ -424,6 +452,7 @@ impl G722Encoder {
 
     /// Encode high band sample and update state
     /// Returns the encoded high band bits
+    #[inline]
     fn encode_high_band(&mut self, xhigh: i32) -> i32 {
         // Block 1H, SUBTRA - Calculate difference signal
         let eh = saturate(xhigh - self.band[1].signal_estimate);
@@ -504,6 +533,7 @@ impl G722Decoder {
     }
 
     /// Extracts the next G.722 code from the input data stream
+    #[inline]
     fn extract_code(&mut self, data: &[u8], idx: &mut usize) -> i32 {
         if self.packed {
             // When packed, bits are combined across bytes
@@ -525,6 +555,7 @@ impl G722Decoder {
     }
 
     /// Parses the G.722 code into low-band word and high-band index based on bit rate
+    #[inline]
     fn parse_code(&self, code: i32) -> (i32, i32, i32) {
         // Returns (wd1, ihigh, wd2) tuple: low-band word, high-band index, and scaled value
         match self.bits_per_sample {
@@ -553,6 +584,7 @@ impl G722Decoder {
     }
 
     /// Process the low band component of the G.722 stream
+    #[inline]
     fn process_low_band(&mut self, wd1: i32, wd2: i32) -> i32 {
         // Block 5L, LOW BAND INVQBL - Inverse quantization for low band
         let dequant = (self.band[0].log_scale_factor * wd2) >> 15;
@@ -590,6 +622,7 @@ impl G722Decoder {
     }
 
     /// Process the high band component of the G.722 stream
+    #[inline]
     fn process_high_band(&mut self, ihigh: i32) -> i32 {
         // Block 2H, INVQAH - Inverse quantizer for high band
         let wd2 = QUANT_MULT_HIGH_2BIT[ihigh as usize];
@@ -624,6 +657,7 @@ impl G722Decoder {
     }
 
     /// Apply QMF synthesis filter to combine low and high band signals
+    #[inline]
     fn apply_qmf_synthesis(&mut self, rlow: i32, rhigh: i32) -> [i16; 2] {
         // Shift filter state
         self.x.copy_within(2..24, 0);
@@ -632,14 +666,32 @@ impl G722Decoder {
         self.x[22] = rlow + rhigh;
         self.x[23] = rlow - rhigh;
 
-        // Apply QMF synthesis filter
-        let mut xout1 = 0;
-        let mut xout2 = 0;
+        // Apply QMF synthesis filter (unrolled loop for 12 coefficients)
+        let mut xout2 = self.x[0] * QMF_FILTER_COEFS[0];
+        xout2 += self.x[2] * QMF_FILTER_COEFS[1];
+        xout2 += self.x[4] * QMF_FILTER_COEFS[2];
+        xout2 += self.x[6] * QMF_FILTER_COEFS[3];
+        xout2 += self.x[8] * QMF_FILTER_COEFS[4];
+        xout2 += self.x[10] * QMF_FILTER_COEFS[5];
+        xout2 += self.x[12] * QMF_FILTER_COEFS[6];
+        xout2 += self.x[14] * QMF_FILTER_COEFS[7];
+        xout2 += self.x[16] * QMF_FILTER_COEFS[8];
+        xout2 += self.x[18] * QMF_FILTER_COEFS[9];
+        xout2 += self.x[20] * QMF_FILTER_COEFS[10];
+        xout2 += self.x[22] * QMF_FILTER_COEFS[11];
 
-        for i in 0..12 {
-            xout2 += self.x[2 * i] * QMF_FILTER_COEFS[i];
-            xout1 += self.x[2 * i + 1] * QMF_FILTER_COEFS[11 - i];
-        }
+        let mut xout1 = self.x[1] * QMF_FILTER_COEFS[11];
+        xout1 += self.x[3] * QMF_FILTER_COEFS[10];
+        xout1 += self.x[5] * QMF_FILTER_COEFS[9];
+        xout1 += self.x[7] * QMF_FILTER_COEFS[8];
+        xout1 += self.x[9] * QMF_FILTER_COEFS[7];
+        xout1 += self.x[11] * QMF_FILTER_COEFS[6];
+        xout1 += self.x[13] * QMF_FILTER_COEFS[5];
+        xout1 += self.x[15] * QMF_FILTER_COEFS[4];
+        xout1 += self.x[17] * QMF_FILTER_COEFS[3];
+        xout1 += self.x[19] * QMF_FILTER_COEFS[2];
+        xout1 += self.x[21] * QMF_FILTER_COEFS[1];
+        xout1 += self.x[23] * QMF_FILTER_COEFS[0];
 
         // Return reconstructed samples with proper scaling
         [saturate(xout1 >> 11) as i16, saturate(xout2 >> 11) as i16]
@@ -651,29 +703,23 @@ impl G722Decoder {
         let mut output = Vec::with_capacity(data.len() * 2);
         let mut idx = 0;
 
-        while idx < data.len() {
-            // Extract the next code from input data
-            let code = self.extract_code(data, &mut idx);
-
-            // Parse the code into components based on bit rate mode
-            let (wd1, ihigh, wd2) = self.parse_code(code);
-
-            // Process the low band component
-            let rlow = self.process_low_band(wd1, wd2);
-
-            if self.eight_k {
-                // 8kHz mode - use only low band with scaling
+        if self.eight_k {
+            while idx < data.len() {
+                let code = self.extract_code(data, &mut idx);
+                let (wd1, _, wd2) = self.parse_code(code);
+                let rlow = self.process_low_band(wd1, wd2);
                 output.push((rlow << 1) as i16);
-            } else {
-                // 16kHz mode - process high band and combine with QMF synthesis
+            }
+        } else {
+            while idx < data.len() {
+                let code = self.extract_code(data, &mut idx);
+                let (wd1, ihigh, wd2) = self.parse_code(code);
+                let rlow = self.process_low_band(wd1, wd2);
                 let rhigh = self.process_high_band(ihigh);
-
-                // Apply QMF synthesis filter to get reconstructed samples
-                let samples = self.apply_qmf_synthesis(rlow, rhigh);
-                output.extend_from_slice(&samples);
+                let pcm = self.apply_qmf_synthesis(rlow, rhigh);
+                output.extend_from_slice(&pcm);
             }
         }
-
         output
     }
 }

@@ -18,6 +18,19 @@ A collection of VoIP audio codecs implemented in or wrapped for Rust. This crate
 - **Resampler**: Built-in audio resampling utility.
 - **Lightweight**: Minimal dependencies for core codecs.
 
+## Performance
+
+Measured on Apple M2 Pro (processing **20ms** audio frames):
+
+| Codec | Encode (20ms) | Decode (20ms) | Rate |
+|-------|---------------|---------------|------|
+| **PCMU/A** | ~50 ns | ~80 ns | 8kHz |
+| **G.722** | ~6.1 µs | ~3.7 µs | 16kHz |
+| **G.729** | ~21.8 µs | ~6.2 µs | 8kHz |
+| **Opus** | ~84.1 µs | ~21.8 µs | 48kHz |
+
+*Note: Benchmarks run using `cargo bench`. Performance may vary by hardware and configuration.*
+
 ## Usage
 
 Add this to your `Cargo.toml`:
@@ -44,12 +57,11 @@ fn main() {
 ### Example: Encoding G.722
 
 ```rust
-use audio_codec::g722::G722Encoder;
-use audio_codec::Encoder;
+use audio_codec::{create_encoder, CodecType, Encoder};
 
 fn main() {
-    let mut encoder = G722Encoder::new();
-    let pcm_samples: Vec<i16> = vec![0; 320]; // 16kHz mono
+    let mut encoder = create_encoder(CodecType::G722);
+    let pcm_samples: Vec<i16> = vec![0; 320]; // 20ms @ 16kHz mono
     let encoded_data = encoder.encode(&pcm_samples);
     
     println!("Encoded into {} bytes", encoded_data.len());

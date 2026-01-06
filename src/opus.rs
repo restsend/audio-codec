@@ -67,6 +67,10 @@ impl OpusDecoder {
 
     /// Create a default Opus decoder (48kHz, stereo)
     pub fn new_default() -> Self {
+        #[cfg(feature = "opus_mono")]
+        {
+            return Self::new(48000, 1);
+        }
         Self::new(48000, 2)
     }
 }
@@ -183,6 +187,10 @@ impl OpusEncoder {
 
     /// Create a default Opus encoder (48kHz, stereo)
     pub fn new_default() -> Self {
+        #[cfg(feature = "opus_mono")]
+        {
+            return Self::new(48000, 1);
+        }
         Self::new(48000, 2)
     }
 

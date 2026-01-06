@@ -183,6 +183,23 @@ impl TryFrom<u8> for CodecType {
     }
 }
 
+impl TryFrom<&str> for CodecType {
+    type Error = anyhow::Error;
+
+    fn try_from(name: &str) -> Result<Self, Self::Error> {
+        match name.to_lowercase().as_str() {
+            "pcmu" | "ulaw" => Ok(CodecType::PCMU),
+            "pcma" | "alaw" => Ok(CodecType::PCMA),
+            "g722" => Ok(CodecType::G722),
+            "g729" => Ok(CodecType::G729),
+            #[cfg(feature = "opus")]
+            "opus" => Ok(CodecType::Opus),
+            "telephone-event" => Ok(CodecType::TelephoneEvent),
+            _ => Err(anyhow::anyhow!("Invalid codec name: {}", name)),
+        }
+    }
+}
+
 #[cfg(target_endian = "little")]
 pub fn samples_to_bytes(samples: &[Sample]) -> Vec<u8> {
     unsafe {
