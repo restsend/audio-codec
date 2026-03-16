@@ -35,7 +35,7 @@ impl OpusDecoder {
 impl Decoder for OpusDecoder {
     fn decode(&mut self, data: &[u8]) -> PcmBuf {
         let channels = usize::from(self.channels);
-        if channels == 0 {
+        if channels == 0 || data.is_empty() {
             return Vec::new();
         }
 
@@ -43,9 +43,7 @@ impl Decoder for OpusDecoder {
         let max_samples = 11520;
         let mut output = vec![0f32; max_samples];
 
-        let result = self.decoder.decode(data, max_samples / channels, &mut output);
-
-        match result {
+        match self.decoder.decode(data, max_samples / channels, &mut output) {
             Ok(len) => {
                 let total_samples = len * channels;
                 output.truncate(total_samples);
