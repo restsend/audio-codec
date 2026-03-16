@@ -1,30 +1,10 @@
 use super::{Decoder, Encoder, PcmBuf, Sample};
 
-use opusic_sys::{
-    OPUS_APPLICATION_VOIP, OPUS_OK, OpusDecoder as OpusDecoderRaw, OpusEncoder as OpusEncoderRaw,
-    opus_decode, opus_decoder_create, opus_decoder_destroy, opus_encode, opus_encoder_create,
-    opus_encoder_destroy, opus_strerror,
-};
-use std::{ffi::CStr, os::raw::c_int, ptr::NonNull};
+use opus_rs::{OpusDecoder as OpusDecoderRaw, OpusEncoder as OpusEncoderRaw, Application};
 
-fn opus_error_message(code: c_int) -> String {
-    if code == OPUS_OK {
-        return "ok".to_string();
-    }
-
-    unsafe {
-        let ptr = opus_strerror(code);
-        if ptr.is_null() {
-            format!("error code {code}")
-        } else {
-            CStr::from_ptr(ptr).to_string_lossy().into_owned()
-        }
-    }
-}
-
-/// Opus audio decoder backed by opusic-sys
+/// Opus audio decoder backed by opus-rs
 pub struct OpusDecoder {
-    decoder: NonNull<OpusDecoderRaw>,
+    decoder: OpusDecoderRaw,
     sample_rate: u32,
     channels: u16,
 }
@@ -32,59 +12,25 @@ pub struct OpusDecoder {
 impl OpusDecoder {
     /// Create a new Opus decoder instance
     pub fn new(sample_rate: u32, channels: u16) -> Self {
-        let channel_count: c_int = if channels == 1 { 1 } else { 2 };
-        let mut error: c_int = 0;
-        let ptr = unsafe {
-            opus_decoder_create(
-                sample_rate as c_int,
-                channel_count,
-                &mut error as *mut c_int,
-            )
-        };
-
-        if error != OPUS_OK {
-            unsafe {
-                if !ptr.is_null() {
-                    opus_decoder_destroy(ptr);
-                }
-            }
-            panic!(
-                "Failed to create Opus decoder: {}",
-                opus_error_message(error)
-            );
-        }
-
-        let decoder = NonNull::new(ptr).unwrap_or_else(|| {
-            panic!("Failed to create Opus decoder: null pointer returned");
-        });
+        let decoder = OpusDecoderRaw::new(sample_rate as i32, channels as usize)
+            .expect("Failed to create Opus decoder");
 
         Self {
             decoder,
             sample_rate,
-            channels: if channel_count == 1 { 1 } else { 2 },
+            channels,
         }
     }
 
     /// Create a default Opus decoder (48kHz, stereo)
     pub fn new_default() -> Self {
         #[cfg(feature = "opus_mono")]
-        {
-            return Self::new(48000, 1);
-        }
+        return Self::new(48000, 1);
+
+        #[cfg(not(feature = "opus_mono"))]
         Self::new(48000, 2)
     }
 }
-
-impl Drop for OpusDecoder {
-    fn drop(&mut self) {
-        unsafe {
-            opus_decoder_destroy(self.decoder.as_ptr());
-        }
-    }
-}
-
-unsafe impl Send for OpusDecoder {}
-unsafe impl Sync for OpusDecoder {}
 
 impl Decoder for OpusDecoder {
     fn decode(&mut self, data: &[u8]) -> PcmBuf {
@@ -93,43 +39,34 @@ impl Decoder for OpusDecoder {
             return Vec::new();
         }
 
-        // Allow up to 120ms of audio as before: 48kHz * 0.12s * 2 channels = 11520 samples
+        // Allow up to 120ms of audio: 48kHz * 0.12s * 2 channels = 11520 samples
         let max_samples = 11520;
-        let mut output = vec![0i16; max_samples];
-        let frame_size = (max_samples / channels) as c_int;
+        let mut output = vec![0f32; max_samples];
 
-        let data_ptr = if data.is_empty() {
-            std::ptr::null()
-        } else {
-            data.as_ptr()
-        };
+        let result = self.decoder.decode(data, max_samples / channels, &mut output);
 
-        let len = unsafe {
-            opus_decode(
-                self.decoder.as_ptr(),
-                data_ptr.cast(),
-                data.len() as c_int,
-                output.as_mut_ptr().cast(),
-                frame_size,
-                0,
-            )
-        };
+        match result {
+            Ok(len) => {
+                let total_samples = len * channels;
+                output.truncate(total_samples);
 
-        if len < 0 {
-            return Vec::new();
+                // Convert f32 to i16
+                let pcm: Vec<i16> = output
+                    .iter()
+                    .map(|&s| (s * 32768.0).clamp(-32768.0, 32767.0) as i16)
+                    .collect();
+
+                // If stereo, convert to mono
+                if channels == 2 {
+                    pcm.chunks_exact(2)
+                        .map(|chunk| ((chunk[0] as i32 + chunk[1] as i32) / 2) as i16)
+                        .collect()
+                } else {
+                    pcm
+                }
+            }
+            Err(_) => Vec::new(),
         }
-
-        let total_samples = (len as usize) * channels;
-        output.truncate(total_samples);
-
-        if channels == 2 {
-            output = output
-                .chunks_exact(2)
-                .map(|chunk| ((chunk[0] as i32 + chunk[1] as i32) / 2) as i16)
-                .collect();
-        }
-
-        output
     }
 
     fn sample_rate(&self) -> u32 {
@@ -141,9 +78,9 @@ impl Decoder for OpusDecoder {
     }
 }
 
-/// Opus audio encoder backed by opusic-sys
+/// Opus audio encoder backed by opus-rs
 pub struct OpusEncoder {
-    encoder: NonNull<OpusEncoderRaw>,
+    encoder: OpusEncoderRaw,
     sample_rate: u32,
     channels: u16,
 }
@@ -151,46 +88,26 @@ pub struct OpusEncoder {
 impl OpusEncoder {
     /// Create a new Opus encoder instance
     pub fn new(sample_rate: u32, channels: u16) -> Self {
-        let channel_count: c_int = if channels == 1 { 1 } else { 2 };
-        let mut error: c_int = 0;
-        let ptr = unsafe {
-            opus_encoder_create(
-                sample_rate as c_int,
-                channel_count,
-                OPUS_APPLICATION_VOIP,
-                &mut error as *mut c_int,
-            )
-        };
-
-        if error != OPUS_OK {
-            unsafe {
-                if !ptr.is_null() {
-                    opus_encoder_destroy(ptr);
-                }
-            }
-            panic!(
-                "Failed to create Opus encoder: {}",
-                opus_error_message(error)
-            );
-        }
-
-        let encoder = NonNull::new(ptr).unwrap_or_else(|| {
-            panic!("Failed to create Opus encoder: null pointer returned");
-        });
+        let encoder = OpusEncoderRaw::new(
+            sample_rate as i32,
+            channels as usize,
+            Application::Voip,
+        )
+        .expect("Failed to create Opus encoder");
 
         Self {
             encoder,
             sample_rate,
-            channels: if channel_count == 1 { 1 } else { 2 },
+            channels,
         }
     }
 
     /// Create a default Opus encoder (48kHz, stereo)
     pub fn new_default() -> Self {
         #[cfg(feature = "opus_mono")]
-        {
-            return Self::new(48000, 1);
-        }
+        return Self::new(48000, 1);
+
+        #[cfg(not(feature = "opus_mono"))]
         Self::new(48000, 2)
     }
 
@@ -200,37 +117,27 @@ impl OpusEncoder {
             return Vec::new();
         }
 
-        let frame_size = (samples.len() / channels) as c_int;
-        let mut output = vec![0u8; samples.len()];
-        let len = unsafe {
-            opus_encode(
-                self.encoder.as_ptr(),
-                samples.as_ptr().cast(),
-                frame_size,
-                output.as_mut_ptr(),
-                output.len() as c_int,
-            )
-        };
+        let frame_size = samples.len() / channels;
 
-        if len < 0 {
-            Vec::new()
-        } else {
-            output.truncate(len as usize);
-            output
+        // Convert i16 samples to f32
+        let input: Vec<f32> = samples
+            .iter()
+            .map(|&s| s as f32 / 32768.0)
+            .collect();
+
+        // Estimate max output size: 1 byte per 80 samples (worst case)
+        let max_output_size = (frame_size / 20).max(1) + 2;
+        let mut output = vec![0u8; max_output_size];
+
+        match self.encoder.encode(&input, frame_size, &mut output) {
+            Ok(len) => {
+                output.truncate(len);
+                output
+            }
+            Err(_) => Vec::new(),
         }
     }
 }
-
-impl Drop for OpusEncoder {
-    fn drop(&mut self) {
-        unsafe {
-            opus_encoder_destroy(self.encoder.as_ptr());
-        }
-    }
-}
-
-unsafe impl Send for OpusEncoder {}
-unsafe impl Sync for OpusEncoder {}
 
 impl Encoder for OpusEncoder {
     fn encode(&mut self, samples: &[Sample]) -> Vec<u8> {

@@ -1,6 +1,6 @@
 [package]
 name = "audio-codec"
-version = "0.3.30"
+version = "0.3.31"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A collection of VoIP audio codecs in Rust, including G.711, G.722, G.729, and Opus."
@@ -11,8 +11,8 @@ keywords = ["sip", "voip", "telephony", "webrtc"]
 categories = ["multimedia"]
 
 [features]
-opus = ["dep:opusic-sys"]
-opus_mono = ["opus", "dep:opusic-sys"]
+opus = ["dep:opus-rs"]
+opus_mono = ["opus", "dep:opus-rs"]
 default = ["opus"]
 
 [lib]
@@ -21,7 +21,7 @@ crate-type = ["rlib"]
 [dependencies]
 anyhow = "1"
 g729-sys = "0.1.2"
-opusic-sys = { version = "0.5.8", optional = true }
+opus-rs = { version = "0.1.5", optional = true }
 
 [dev-dependencies]
 hound = "3.5.1"

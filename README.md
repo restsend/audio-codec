@@ -8,8 +8,8 @@ A collection of VoIP audio codecs implemented in or wrapped for Rust. This crate
 |-------|----------------|---------|
 | **G.711 (PCMA/PCMU)** | Pure Rust | Built-in |
 | **G.722** | Pure Rust | Built-in |
-| **G.729** | Wrapper (`g729-sys`) | Built-in |
-| **Opus** | Wrapper (`opusic-sys`) | `opus` (default) |
+| **G.729** | Pure Rust (`g729-sys`) | Built-in |
+| **Opus** | Pure Rust (`opus-rs`) | `opus` (default) |
 | **Telephone Event** | RFC 4733 | Built-in |
 
 ## Features
@@ -24,12 +24,14 @@ Measured on Apple M2 Pro (processing **20ms** audio frames):
 
 | Codec | Encode (20ms) | Decode (20ms) | Rate |
 |-------|---------------|---------------|------|
-| **PCMU/A** | ~50 ns | ~80 ns | 8kHz |
-| **G.722** | ~6.1 µs | ~3.7 µs | 16kHz |
-| **G.729** | ~21.8 µs | ~6.2 µs | 8kHz |
-| **Opus** | ~84.1 µs | ~21.8 µs | 48kHz |
+| **PCMU/A** | ~52 ns | ~60 ns | 8kHz |
+| **G.722** | ~5.2 µs | ~3.7 µs | 16kHz |
+| **G.729** | ~23.7 µs | ~6.2 µs | 8kHz |
+| **Opus** | ~52.9 µs | ~7.4 µs | 48kHz |
 
 *Note: Benchmarks run using `cargo bench`. Performance may vary by hardware and configuration.*
+
+> **Opus Performance**: The pure Rust implementation (`opus-rs`) is significantly faster than the FFI version (`opusic-sys`): **+37% faster encoding** (~84µs → ~53µs) and **+66% faster decoding** (~22µs → ~7µs) on Apple M2 Pro.
 
 ## Usage
 
