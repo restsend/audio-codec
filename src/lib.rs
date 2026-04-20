@@ -68,6 +68,24 @@ pub fn create_encoder(codec: CodecType) -> Box<dyn Encoder> {
     }
 }
 
+#[cfg(feature = "opus")]
+pub fn create_opus_encoder(
+    sample_rate: u32,
+    channels: u16,
+    application: opus::OpusApplication,
+) -> Box<dyn Encoder> {
+    Box::new(opus::OpusEncoder::new_with_application(
+        sample_rate,
+        channels,
+        application,
+    ))
+}
+
+#[cfg(feature = "opus")]
+pub fn create_opus_decoder(sample_rate: u32, channels: u16) -> Box<dyn Decoder> {
+    Box::new(opus::OpusDecoder::new(sample_rate, channels))
+}
+
 impl CodecType {
     pub fn mime_type(&self) -> &str {
         match self {
@@ -98,7 +116,7 @@ impl CodecType {
             CodecType::G722 => None,
             CodecType::G729 => None,
             #[cfg(feature = "opus")]
-            CodecType::Opus => Some("minptime=10;useinbandfec=1"),
+            CodecType::Opus => Some("minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1"),
             CodecType::TelephoneEvent => Some("0-16"),
         }
     }

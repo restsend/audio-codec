@@ -1,12 +1,13 @@
 use super::{Decoder, Encoder, PcmBuf, Sample};
+pub use opus_rs::Application as OpusApplication;
+use opus_rs::{Application, OpusDecoder as OpusDecoderRaw, OpusEncoder as OpusEncoderRaw};
 
-use opus_rs::{OpusDecoder as OpusDecoderRaw, OpusEncoder as OpusEncoderRaw, Application};
-
-/// Opus audio decoder backed by opus-rs
 pub struct OpusDecoder {
     decoder: OpusDecoderRaw,
     sample_rate: u32,
     channels: u16,
+    w_output_f32: Vec<f32>,
+    w_pcm_i16: Vec<i16>,
 }
 
 impl OpusDecoder {
@@ -19,16 +20,54 @@ impl OpusDecoder {
             decoder,
             sample_rate,
             channels,
+            w_output_f32: Vec::new(),
+            w_pcm_i16: Vec::new(),
         }
     }
 
     /// Create a default Opus decoder (48kHz, stereo)
     pub fn new_default() -> Self {
-        #[cfg(feature = "opus_mono")]
-        return Self::new(48000, 1);
-
-        #[cfg(not(feature = "opus_mono"))]
         Self::new(48000, 2)
+    }
+
+    pub fn decode_into(&mut self, data: &[u8], output: &mut [i16]) -> usize {
+        let channels = usize::from(self.channels);
+        if channels == 0 || data.is_empty() {
+            return 0;
+        }
+
+        // opus-rs currently handles up to 20ms frames reliably; use that as the decode frame size
+        let frame_size = (self.sample_rate as usize * 20) / 1000;
+        let max_samples = frame_size * channels;
+        if self.w_output_f32.len() < max_samples {
+            self.w_output_f32.resize(max_samples, 0.0);
+        }
+
+        match self
+            .decoder
+            .decode(data, frame_size, &mut self.w_output_f32[..max_samples])
+        {
+            Ok(len) => {
+                let total_samples = len * channels;
+                if total_samples == 0 {
+                    return 0;
+                }
+
+                if self.w_pcm_i16.len() < total_samples {
+                    self.w_pcm_i16.resize(total_samples, 0);
+                }
+
+                for i in 0..total_samples {
+                    self.w_pcm_i16[i] =
+                        (self.w_output_f32[i] * 32768.0).clamp(-32768.0, 32767.0) as i16;
+                }
+
+                let n = total_samples.min(output.len());
+                output[..n].copy_from_slice(&self.w_pcm_i16[..n]);
+                n
+            }
+            Err(_) => 0,
+        }
     }
 }
 
@@ -39,32 +78,12 @@ impl Decoder for OpusDecoder {
             return Vec::new();
         }
 
-        // Allow up to 120ms of audio: 48kHz * 0.12s * 2 channels = 11520 samples
-        let max_samples = 11520;
-        let mut output = vec![0f32; max_samples];
-
-        match self.decoder.decode(data, max_samples / channels, &mut output) {
-            Ok(len) => {
-                let total_samples = len * channels;
-                output.truncate(total_samples);
-
-                // Convert f32 to i16
-                let pcm: Vec<i16> = output
-                    .iter()
-                    .map(|&s| (s * 32768.0).clamp(-32768.0, 32767.0) as i16)
-                    .collect();
-
-                // If stereo, convert to mono
-                if channels == 2 {
-                    pcm.chunks_exact(2)
-                        .map(|chunk| ((chunk[0] as i32 + chunk[1] as i32) / 2) as i16)
-                        .collect()
-                } else {
-                    pcm
-                }
-            }
-            Err(_) => Vec::new(),
-        }
+        let frame_size = (self.sample_rate as usize * 20) / 1000;
+        let max_samples = frame_size * channels;
+        let mut pcm = vec![0i16; max_samples];
+        let n = self.decode_into(data, &mut pcm);
+        pcm.truncate(n);
+        pcm
     }
 
     fn sample_rate(&self) -> u32 {
@@ -76,37 +95,88 @@ impl Decoder for OpusDecoder {
     }
 }
 
-/// Opus audio encoder backed by opus-rs
 pub struct OpusEncoder {
     encoder: OpusEncoderRaw,
     sample_rate: u32,
     channels: u16,
+    w_input_f32: Vec<f32>,
+    w_packet: Vec<u8>,
 }
 
 impl OpusEncoder {
-    /// Create a new Opus encoder instance
-    pub fn new(sample_rate: u32, channels: u16) -> Self {
-        let encoder = OpusEncoderRaw::new(
-            sample_rate as i32,
-            channels as usize,
-            Application::Voip,
-        )
-        .expect("Failed to create Opus encoder");
+    pub fn new_with_application(sample_rate: u32, channels: u16, application: Application) -> Self {
+        let encoder = OpusEncoderRaw::new(sample_rate as i32, channels as usize, application)
+            .expect("Failed to create Opus encoder");
 
         Self {
             encoder,
             sample_rate,
             channels,
+            w_input_f32: Vec::new(),
+            w_packet: vec![0u8; 1275],
         }
     }
 
-    /// Create a default Opus encoder (48kHz, stereo)
-    pub fn new_default() -> Self {
-        #[cfg(feature = "opus_mono")]
-        return Self::new(48000, 1);
+    /// Create a new Opus encoder instance.
+    ///
+    /// For stereo input, prefer `Application::Audio` by default.
+    /// `opus-rs` currently has stability issues on some 48k stereo VoIP paths.
+    pub fn new(sample_rate: u32, channels: u16) -> Self {
+        let app = if channels == 2 {
+            Application::Audio
+        } else {
+            Application::Voip
+        };
+        let mut enc = Self::new_with_application(sample_rate, channels, app);
+        enc.encoder.bitrate_bps = if channels == 2 { 64000 } else { 48000 };
+        enc.encoder.complexity = if channels == 2 { 5 } else { 0 };
+        enc
+    }
 
-        #[cfg(not(feature = "opus_mono"))]
+    /// Create a default Opus encoder (48kHz, stereo, Audio mode, 64kbps)
+    pub fn new_default() -> Self {
         Self::new(48000, 2)
+    }
+
+    /// Set the encoder bitrate in bits per second.
+    pub fn set_bitrate(&mut self, bitrate_bps: i32) {
+        self.encoder.bitrate_bps = bitrate_bps;
+    }
+
+    /// Set the encoder complexity (0-10).
+    pub fn set_complexity(&mut self, complexity: i32) {
+        self.encoder.complexity = complexity;
+    }
+
+    /// Enable or disable constant bitrate (CBR) mode.
+    pub fn set_cbr(&mut self, cbr: bool) {
+        self.encoder.use_cbr = cbr;
+    }
+
+    /// Encode into a caller-provided packet buffer.
+    ///
+    /// Returns `Some(bytes_written)` on success.
+    pub fn encode_into(&mut self, samples: &[Sample], output: &mut [u8]) -> Option<usize> {
+        let channels = usize::from(self.channels);
+        if samples.is_empty() || channels == 0 || samples.len() % channels != 0 {
+            return None;
+        }
+
+        let frame_size = samples.len() / channels;
+
+        if self.w_input_f32.len() < samples.len() {
+            self.w_input_f32.resize(samples.len(), 0.0);
+        }
+        for (dst, &s) in self.w_input_f32[..samples.len()]
+            .iter_mut()
+            .zip(samples.iter())
+        {
+            *dst = s as f32 / 32768.0;
+        }
+
+        self.encoder
+            .encode(&self.w_input_f32[..samples.len()], frame_size, output)
+            .ok()
     }
 
     fn encode_raw(&mut self, samples: &[Sample]) -> Vec<u8> {
@@ -117,20 +187,25 @@ impl OpusEncoder {
 
         let frame_size = samples.len() / channels;
 
-        // Convert i16 samples to f32
-        let input: Vec<f32> = samples
-            .iter()
-            .map(|&s| s as f32 / 32768.0)
-            .collect();
+        if self.w_input_f32.len() < samples.len() {
+            self.w_input_f32.resize(samples.len(), 0.0);
+        }
+        for (dst, &s) in self.w_input_f32[..samples.len()]
+            .iter_mut()
+            .zip(samples.iter())
+        {
+            *dst = s as f32 / 32768.0;
+        }
 
-        // Estimate max output size: 1 byte per 80 samples (worst case)
-        let max_output_size = (frame_size / 20).max(1) + 2;
-        let mut output = vec![0u8; max_output_size];
-
-        match self.encoder.encode(&input, frame_size, &mut output) {
+        match self.encoder.encode(
+            &self.w_input_f32[..samples.len()],
+            frame_size,
+            &mut self.w_packet,
+        ) {
             Ok(len) => {
-                output.truncate(len);
-                output
+                let mut out = Vec::with_capacity(len);
+                out.extend_from_slice(&self.w_packet[..len]);
+                out
             }
             Err(_) => Vec::new(),
         }
@@ -139,15 +214,6 @@ impl OpusEncoder {
 
 impl Encoder for OpusEncoder {
     fn encode(&mut self, samples: &[Sample]) -> Vec<u8> {
-        if self.channels == 2 {
-            let mut stereo_samples = Vec::with_capacity(samples.len() * 2);
-            for &sample in samples {
-                stereo_samples.push(sample);
-                stereo_samples.push(sample);
-            }
-            return self.encode_raw(&stereo_samples);
-        }
-
         self.encode_raw(samples)
     }
 

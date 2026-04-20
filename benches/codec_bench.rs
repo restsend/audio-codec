@@ -1,5 +1,7 @@
+use std::hint::black_box;
+
 use audio_codec::{CodecType, create_decoder, create_encoder};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 fn bench_codec(c: &mut Criterion) {
     let codecs = [

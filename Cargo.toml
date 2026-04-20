@@ -21,12 +21,12 @@ crate-type = ["rlib"]
 [dependencies]
 anyhow = "1"
 g729-sys = "0.1.2"
-opus-rs = { version = "0.1.7", optional = true }
+opus-rs = { version = "0.1.16", optional = true }
 
 [dev-dependencies]
 hound = "3.5.1"
-clap = { version = "4.5", features = ["derive"] }
-criterion = { version = "0.5", features = ["html_reports"] }
+clap = { version = "4.6.1", features = ["derive"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
 
 [[bench]]
 name = "codec_bench"

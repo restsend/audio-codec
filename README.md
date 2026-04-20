@@ -1,6 +1,6 @@
 # audio-codec
 
-A collection of VoIP audio codecs implemented in or wrapped for Rust. This crate provides a unified interface for encoding and decoding various audio formats commonly used in SIP, VoIP, and WebRTC applications.
+A collection of VoIP audio codecs implemented for Rust. This crate provides a unified interface for encoding and decoding various audio formats commonly used in SIP, VoIP, and WebRTC applications.
 
 ## Supported Codecs
 
@@ -24,14 +24,13 @@ Measured on Apple M2 Pro (processing **20ms** audio frames):
 
 | Codec | Encode (20ms) | Decode (20ms) | Rate |
 |-------|---------------|---------------|------|
-| **PCMU/A** | ~52 ns | ~60 ns | 8kHz |
-| **G.722** | ~5.2 µs | ~3.7 µs | 16kHz |
-| **G.729** | ~23.7 µs | ~6.2 µs | 8kHz |
-| **Opus** | ~52.9 µs | ~7.4 µs | 48kHz |
+| **PCMU** | ~50.09 ns | ~59.73 ns | 8kHz |
+| **PCMA** | ~50.23 ns | ~59.63 ns | 8kHz |
+| **G.722** | ~5.02 µs | ~3.82 µs | 16kHz |
+| **G.729** | ~20.50 µs | ~6.16 µs | 8kHz |
+| **Opus** | ~52.34 µs | ~23.19 µs | 48kHz |
 
-*Note: Benchmarks run using `cargo bench`. Performance may vary by hardware and configuration.*
-
-> **Opus Performance**: The pure Rust implementation (`opus-rs`) is significantly faster than the FFI version (`opusic-sys`): **+37% faster encoding** (~84µs → ~53µs) and **+66% faster decoding** (~22µs → ~7µs) on Apple M2 Pro.
+*Note: Benchmarks were run with `cargo bench --bench codec_bench` (Criterion). `create_encoder(CodecType::Opus)` currently uses the default Opus profile: 48kHz, stereo, `Application::Audio`, bitrate 64kbps, complexity 5.*
 
 ## Usage
 
@@ -67,6 +66,29 @@ fn main() {
     let encoded_data = encoder.encode(&pcm_samples);
     
     println!("Encoded into {} bytes", encoded_data.len());
+}
+```
+
+### Example: Configuring Opus (Factory API)
+
+```rust
+use audio_codec::{
+    create_opus_decoder, create_opus_encoder, Decoder, Encoder,
+    opus::OpusApplication,
+};
+
+fn main() {
+    // Explicit Opus encoder/decoder creation
+    // 48kHz stereo, Audio mode
+    let mut encoder = create_opus_encoder(48_000, 2, OpusApplication::Audio);
+    let mut decoder = create_opus_decoder(48_000, 2);
+
+    let pcm_samples: Vec<i16> = vec![0; 960 * 2]; // 20ms @ 48kHz, interleaved stereo
+    let encoded_data = encoder.encode(&pcm_samples);
+    let decoded_pcm = decoder.decode(&encoded_data);
+
+    println!("Encoded into {} bytes", encoded_data.len());
+    println!("Decoded {} samples", decoded_pcm.len());
 }
 ```
 
