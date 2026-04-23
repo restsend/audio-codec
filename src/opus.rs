@@ -119,21 +119,19 @@ impl OpusEncoder {
 
     /// Create a new Opus encoder instance.
     ///
-    /// For stereo input, prefer `Application::Audio` by default.
-    /// `opus-rs` currently has stability issues on some 48k stereo VoIP paths.
+    /// Keep backward-compatible defaults with pre-0.3.31 behavior:
+    /// - VoIP application
+    /// - caller can provide mono PCM even when encoder is configured as stereo;
+    ///   `encode()` duplicates mono samples to stereo.
     pub fn new(sample_rate: u32, channels: u16) -> Self {
-        let app = if channels == 2 {
-            Application::Audio
-        } else {
-            Application::Voip
-        };
-        let mut enc = Self::new_with_application(sample_rate, channels, app);
+        let mut enc = Self::new_with_application(sample_rate, channels, Application::Voip);
         enc.encoder.bitrate_bps = if channels == 2 { 64000 } else { 48000 };
-        enc.encoder.complexity = if channels == 2 { 5 } else { 0 };
+        enc.encoder.complexity = 5;
+        enc.encoder.use_cbr = true;
         enc
     }
 
-    /// Create a default Opus encoder (48kHz, stereo, Audio mode, 64kbps)
+    /// Create a default Opus encoder (48kHz, stereo)
     pub fn new_default() -> Self {
         Self::new(48000, 2)
     }
@@ -167,6 +165,7 @@ impl OpusEncoder {
         if self.w_input_f32.len() < samples.len() {
             self.w_input_f32.resize(samples.len(), 0.0);
         }
+
         for (dst, &s) in self.w_input_f32[..samples.len()]
             .iter_mut()
             .zip(samples.iter())
@@ -190,6 +189,7 @@ impl OpusEncoder {
         if self.w_input_f32.len() < samples.len() {
             self.w_input_f32.resize(samples.len(), 0.0);
         }
+
         for (dst, &s) in self.w_input_f32[..samples.len()]
             .iter_mut()
             .zip(samples.iter())
@@ -214,6 +214,17 @@ impl OpusEncoder {
 
 impl Encoder for OpusEncoder {
     fn encode(&mut self, samples: &[Sample]) -> Vec<u8> {
+        if self.channels == 2 {
+            let frame_20ms = (self.sample_rate as usize * 20) / 1000;
+            if samples.len() == frame_20ms {
+                let mut stereo_samples = Vec::with_capacity(samples.len() * 2);
+                for &sample in samples {
+                    stereo_samples.push(sample);
+                    stereo_samples.push(sample);
+                }
+                return self.encode_raw(&stereo_samples);
+            }
+        }
         self.encode_raw(samples)
     }
 
