@@ -31,12 +31,22 @@ impl OpusDecoder {
     }
 
     pub fn decode_into(&mut self, data: &[u8], output: &mut [i16]) -> usize {
-        let channels = usize::from(self.channels);
-        if channels == 0 || data.is_empty() {
+        if data.is_empty() {
             return 0;
         }
 
-        // opus-rs currently handles up to 20ms frames reliably; use that as the decode frame size
+        // Detect the actual channel count from the Opus packet's TOC byte
+        // (bit 2 is the stereo flag per RFC 6716). opus-rs 0.1.19+ rejects
+        // decoding when the packet channel count doesn't match the decoder's,
+        // so we adapt the decoder here to avoid returning empty PCM.
+        let packet_channels = if data[0] & 0x04 != 0 { 2usize } else { 1 };
+        if self.channels as usize != packet_channels {
+            self.channels = packet_channels as u16;
+            self.decoder = OpusDecoderRaw::new(self.sample_rate as i32, packet_channels)
+                .expect("Failed to create Opus decoder");
+        }
+
+        let channels = usize::from(self.channels);
         let frame_size = (self.sample_rate as usize * 20) / 1000;
         let max_samples = frame_size * channels;
         if self.w_output_f32.len() < max_samples {
