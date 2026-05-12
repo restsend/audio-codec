@@ -93,6 +93,12 @@ impl Decoder for OpusDecoder {
         let mut pcm = vec![0i16; max_samples];
         let n = self.decode_into(data, &mut pcm);
         pcm.truncate(n);
+        if channels == 2 {
+            pcm = pcm
+                .chunks_exact(2)
+                .map(|chunk| ((chunk[0] as i32 + chunk[1] as i32) / 2) as i16)
+                .collect();
+        }
         pcm
     }
 
@@ -225,15 +231,12 @@ impl OpusEncoder {
 impl Encoder for OpusEncoder {
     fn encode(&mut self, samples: &[Sample]) -> Vec<u8> {
         if self.channels == 2 {
-            let frame_20ms = (self.sample_rate as usize * 20) / 1000;
-            if samples.len() == frame_20ms {
-                let mut stereo_samples = Vec::with_capacity(samples.len() * 2);
-                for &sample in samples {
-                    stereo_samples.push(sample);
-                    stereo_samples.push(sample);
-                }
-                return self.encode_raw(&stereo_samples);
+            let mut stereo_samples = Vec::with_capacity(samples.len() * 2);
+            for &sample in samples {
+                stereo_samples.push(sample);
+                stereo_samples.push(sample);
             }
+            return self.encode_raw(&stereo_samples);
         }
         self.encode_raw(samples)
     }
