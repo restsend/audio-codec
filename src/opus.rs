@@ -83,18 +83,16 @@ impl OpusDecoder {
 
 impl Decoder for OpusDecoder {
     fn decode(&mut self, data: &[u8]) -> PcmBuf {
-        let input_channels = usize::from(self.channels);
-        if input_channels == 0 || data.is_empty() {
+        if data.is_empty() {
             return Vec::new();
         }
+        let packet_channels = if data[0] & 0x04 != 0 { 2usize } else { 1 };
 
         let frame_size = (self.sample_rate as usize * 20) / 1000;
-        let max_samples = frame_size * input_channels;
+        let max_samples = frame_size * packet_channels;
         let mut pcm = vec![0i16; max_samples];
         let n = self.decode_into(data, &mut pcm);
         pcm.truncate(n);
-        // decode_into may have changed self.channels (mono vs stereo packet),
-        // so re-read it here to decide whether downmix is needed.
         if usize::from(self.channels) == 2 {
             pcm = pcm
                 .chunks_exact(2)
@@ -335,7 +333,10 @@ mod tests {
         let mono_pkt = mono_enc.encode(&pcm);
         assert!(!mono_pkt.is_empty());
         // Mono packet TOC bit 2 should be 0
-        assert!(mono_pkt[0] & 0x04 == 0, "mono encoder should produce mono packet");
+        assert!(
+            mono_pkt[0] & 0x04 == 0,
+            "mono encoder should produce mono packet"
+        );
 
         // Decode with default stereo decoder — should handle mono→stereo transition
         let mut dec = OpusDecoder::new_default();
