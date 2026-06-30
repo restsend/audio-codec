@@ -1,6 +1,6 @@
 [package]
 name = "audio-codec"
-version = "0.3.39"
+version = "0.3.40"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A collection of VoIP audio codecs in pure Rust, including G.711, G.722, G.729, and Opus."

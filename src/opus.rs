@@ -117,6 +117,9 @@ pub struct OpusEncoder {
     channels: u16,
     w_input_f32: Vec<f32>,
     w_packet: Vec<u8>,
+    /// Reusable buffer for mono→stereo upmix.  Avoids a per-frame allocation
+    /// in `encode()` when `channels == 2`.
+    w_stereo: Vec<i16>,
 }
 
 impl OpusEncoder {
@@ -130,6 +133,7 @@ impl OpusEncoder {
             channels,
             w_input_f32: Vec::new(),
             w_packet: vec![0u8; 1275],
+            w_stereo: Vec::new(),
         }
     }
 
@@ -231,12 +235,15 @@ impl OpusEncoder {
 impl Encoder for OpusEncoder {
     fn encode(&mut self, samples: &[Sample]) -> Vec<u8> {
         if self.channels == 2 {
-            let mut stereo_samples = Vec::with_capacity(samples.len() * 2);
-            for &sample in samples {
-                stereo_samples.push(sample);
-                stereo_samples.push(sample);
+            let mut stereo = std::mem::take(&mut self.w_stereo);
+            stereo.resize(samples.len() * 2, 0);
+            for (i, &sample) in samples.iter().enumerate() {
+                stereo[2 * i] = sample;
+                stereo[2 * i + 1] = sample;
             }
-            return self.encode_raw(&stereo_samples);
+            let out = self.encode_raw(&stereo);
+            self.w_stereo = stereo;
+            return out;
         }
         self.encode_raw(samples)
     }
