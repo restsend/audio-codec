@@ -1,6 +1,8 @@
-pub type Sample = i16;
-pub type PcmBuf = Vec<Sample>;
+#![cfg_attr(not(feature = "std"), no_std)]
 
+pub use error::CodecError;
+
+pub mod error;
 pub mod g722;
 pub mod g729;
 #[cfg(feature = "opus")]
@@ -9,7 +11,14 @@ pub mod pcma;
 pub mod pcmu;
 pub mod resampler;
 pub mod telephone_event;
+
+#[cfg(feature = "std")]
 pub use resampler::{Resampler, resample};
+
+pub type Sample = i16;
+
+#[cfg(feature = "std")]
+pub type PcmBuf = Vec<Sample>;
 
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CodecType {
@@ -22,28 +31,83 @@ pub enum CodecType {
     TelephoneEvent,
 }
 
+/// Decoder trait: converts codec-specific bytes into PCM samples.
+///
+/// The slice-based `decode_into` is the primary, always-available method
+/// (works in `no_std`). The convenience `decode` returning a `Vec` is only
+/// available with the `std` feature and has a default implementation that
+/// delegates to `decode_into`.
 pub trait Decoder: Send + Sync {
-    /// Decode encoded audio data into PCM samples
-    fn decode(&mut self, data: &[u8]) -> PcmBuf;
+    /// Decode `data` into `out`, returning the number of samples written.
+    ///
+    /// Returns [`CodecError::BufferTooSmall`] if `out` cannot hold the
+    /// decoded samples (use `max_decode_samples` to size it).
+    fn decode_into(&mut self, data: &[u8], out: &mut [Sample]) -> Result<usize, CodecError>;
 
-    /// Get the sample rate of the decoded audio
+    /// Upper bound on the number of samples that `decode_into` will write
+    /// for an input of `n_bytes` bytes.
+    fn max_decode_samples(&self, n_bytes: usize) -> usize;
+
+    /// Get the sample rate of the decoded audio.
     fn sample_rate(&self) -> u32;
 
-    /// Get the number of channels
+    /// Get the number of channels.
     fn channels(&self) -> u16;
+
+    /// Convenience wrapper that allocates a `Vec` and calls `decode_into`.
+    #[cfg(feature = "std")]
+    fn decode(&mut self, data: &[u8]) -> PcmBuf {
+        let max = self.max_decode_samples(data.len());
+        let mut buf = vec![0i16; max];
+        match self.decode_into(data, &mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                buf
+            }
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
+/// Encoder trait: converts PCM samples into codec-specific bytes.
+///
+/// The slice-based `encode_into` is the primary, always-available method
+/// (works in `no_std`). The convenience `encode` returning a `Vec` is only
+/// available with the `std` feature and has a default implementation that
+/// delegates to `encode_into`.
 pub trait Encoder: Send + Sync {
-    /// Encode PCM samples into codec-specific format
-    fn encode(&mut self, samples: &[Sample]) -> Vec<u8>;
+    /// Encode `samples` into `out`, returning the number of bytes written.
+    ///
+    /// Returns [`CodecError::BufferTooSmall`] if `out` cannot hold the
+    /// encoded bytes (use `max_encode_bytes` to size it).
+    fn encode_into(&mut self, samples: &[Sample], out: &mut [u8]) -> Result<usize, CodecError>;
 
-    /// Get the sample rate expected for input samples
+    /// Upper bound on the number of bytes that `encode_into` will write
+    /// for an input of `n_samples` samples.
+    fn max_encode_bytes(&self, n_samples: usize) -> usize;
+
+    /// Get the sample rate expected for input samples.
     fn sample_rate(&self) -> u32;
 
-    /// Get the number of channels expected for input
+    /// Get the number of channels expected for input.
     fn channels(&self) -> u16;
+
+    /// Convenience wrapper that allocates a `Vec` and calls `encode_into`.
+    #[cfg(feature = "std")]
+    fn encode(&mut self, samples: &[Sample]) -> Vec<u8> {
+        let max = self.max_encode_bytes(samples.len());
+        let mut buf = vec![0u8; max];
+        match self.encode_into(samples, &mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                buf
+            }
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
+#[cfg(feature = "std")]
 pub fn create_decoder(codec: CodecType) -> Box<dyn Decoder> {
     match codec {
         CodecType::PCMU => Box::new(pcmu::PcmuDecoder::new()),
@@ -56,6 +120,7 @@ pub fn create_decoder(codec: CodecType) -> Box<dyn Decoder> {
     }
 }
 
+#[cfg(feature = "std")]
 pub fn create_encoder(codec: CodecType) -> Box<dyn Encoder> {
     match codec {
         CodecType::PCMU => Box::new(pcmu::PcmuEncoder::new()),
@@ -68,7 +133,7 @@ pub fn create_encoder(codec: CodecType) -> Box<dyn Encoder> {
     }
 }
 
-#[cfg(feature = "opus")]
+#[cfg(all(feature = "std", feature = "opus"))]
 pub fn create_opus_encoder(
     sample_rate: u32,
     channels: u16,
@@ -81,7 +146,7 @@ pub fn create_opus_encoder(
     ))
 }
 
-#[cfg(feature = "opus")]
+#[cfg(all(feature = "std", feature = "opus"))]
 pub fn create_opus_decoder(sample_rate: u32, channels: u16) -> Box<dyn Decoder> {
     Box::new(opus::OpusDecoder::new(sample_rate, channels))
 }
@@ -184,7 +249,7 @@ impl CodecType {
 }
 
 impl TryFrom<u8> for CodecType {
-    type Error = anyhow::Error;
+    type Error = CodecError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -192,62 +257,114 @@ impl TryFrom<u8> for CodecType {
             8 => Ok(CodecType::PCMA),
             9 => Ok(CodecType::G722),
             18 => Ok(CodecType::G729), // Static payload type
-            // Dynamic payload type shoulw get from the rtpmap in sdp offer, leave this for backward compatibility
+            // Dynamic payload type should get from the rtpmap in sdp offer, leave this for backward compatibility
             101 => Ok(CodecType::TelephoneEvent),
             #[cfg(feature = "opus")]
             111 => Ok(CodecType::Opus), // Dynamic payload type
-            _ => Err(anyhow::anyhow!("Invalid codec type: {}", value)),
+            _ => Err(CodecError::InvalidCodecType),
         }
     }
 }
 
 impl TryFrom<&str> for CodecType {
-    type Error = anyhow::Error;
+    type Error = CodecError;
 
     fn try_from(name: &str) -> Result<Self, Self::Error> {
-        match name.to_lowercase().as_str() {
-            "pcmu" | "ulaw" => Ok(CodecType::PCMU),
-            "pcma" | "alaw" => Ok(CodecType::PCMA),
-            "g722" => Ok(CodecType::G722),
-            "g729" => Ok(CodecType::G729),
+        let b = name.as_bytes();
+        if b.eq_ignore_ascii_case(b"pcmu") || b.eq_ignore_ascii_case(b"ulaw") {
+            Ok(CodecType::PCMU)
+        } else if b.eq_ignore_ascii_case(b"pcma") || b.eq_ignore_ascii_case(b"alaw") {
+            Ok(CodecType::PCMA)
+        } else if b.eq_ignore_ascii_case(b"g722") {
+            Ok(CodecType::G722)
+        } else if b.eq_ignore_ascii_case(b"g729") {
+            Ok(CodecType::G729)
+        } else if cfg!(feature = "opus") && b.eq_ignore_ascii_case(b"opus") {
             #[cfg(feature = "opus")]
-            "opus" => Ok(CodecType::Opus),
-            "telephone-event" => Ok(CodecType::TelephoneEvent),
-            _ => Err(anyhow::anyhow!("Invalid codec name: {}", name)),
+            {
+                Ok(CodecType::Opus)
+            }
+            #[cfg(not(feature = "opus"))]
+            {
+                Err(CodecError::InvalidCodecName)
+            }
+        } else if b.eq_ignore_ascii_case(b"telephone-event") {
+            Ok(CodecType::TelephoneEvent)
+        } else {
+            Err(CodecError::InvalidCodecName)
         }
     }
 }
 
-#[cfg(target_endian = "little")]
-pub fn samples_to_bytes(samples: &[Sample]) -> Vec<u8> {
-    unsafe {
-        std::slice::from_raw_parts(
-            samples.as_ptr() as *const u8,
-            samples.len() * std::mem::size_of::<Sample>(),
-        )
-        .to_vec()
+// ----------------------------------------------------------------------------
+// Byte <-> sample slice helpers
+// ----------------------------------------------------------------------------
+
+/// Write the little-endian byte representation of `samples` into `out`.
+///
+/// Returns the number of bytes written (`samples.len() * 2`). Returns
+/// [`CodecError::BufferTooSmall`] if `out` is too small.
+pub fn samples_to_bytes_into(samples: &[Sample], out: &mut [u8]) -> Result<usize, CodecError> {
+    let needed = core::mem::size_of_val(samples);
+    if out.len() < needed {
+        return Err(CodecError::BufferTooSmall);
     }
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: `[u8; N*2]` and `[i16; N]` have the same size and alignment,
+        // and we just verified `out` is large enough.
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut Sample, samples.len())
+        };
+        dst.copy_from_slice(samples);
+    }
+    #[cfg(target_endian = "big")]
+    {
+        for (i, s) in samples.iter().enumerate() {
+            let b = s.to_le_bytes();
+            out[2 * i] = b[0];
+            out[2 * i + 1] = b[1];
+        }
+    }
+    Ok(needed)
 }
 
-#[cfg(target_endian = "big")]
-pub fn samples_to_bytes(samples: &[Sample]) -> Vec<u8> {
-    samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+/// Decode the little-endian bytes into `out` as `Sample` (i16) values.
+///
+/// Returns the number of samples written (`u8_data.len() / 2`). Returns
+/// [`CodecError::BufferTooSmall`] if `out` cannot hold them all.
+pub fn bytes_to_samples_into(u8_data: &[u8], out: &mut [Sample]) -> Result<usize, CodecError> {
+    let n = u8_data.len() / core::mem::size_of::<Sample>();
+    if out.len() < n {
+        return Err(CodecError::BufferTooSmall);
+    }
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: see `samples_to_bytes_into`.
+        let src =
+            unsafe { core::slice::from_raw_parts(u8_data.as_ptr() as *const Sample, n) };
+        out[..n].copy_from_slice(src);
+    }
+    #[cfg(target_endian = "big")]
+    {
+        for (i, chunk) in u8_data.chunks_exact(2).enumerate() {
+            out[i] = (chunk[0] as i16) | ((chunk[1] as i16) << 8);
+        }
+    }
+    Ok(n)
 }
 
-#[cfg(target_endian = "little")]
-pub fn bytes_to_samples(u8_data: &[u8]) -> PcmBuf {
-    unsafe {
-        std::slice::from_raw_parts(
-            u8_data.as_ptr() as *const Sample,
-            u8_data.len() / std::mem::size_of::<Sample>(),
-        )
-        .to_vec()
-    }
+#[cfg(feature = "std")]
+pub fn samples_to_bytes(samples: &[Sample]) -> Vec<u8> {
+    let mut out = vec![0u8; core::mem::size_of_val(samples)];
+    let _ = samples_to_bytes_into(samples, &mut out);
+    out
 }
-#[cfg(target_endian = "big")]
+
+#[cfg(feature = "std")]
 pub fn bytes_to_samples(u8_data: &[u8]) -> PcmBuf {
-    u8_data
-        .chunks(2)
-        .map(|chunk| (chunk[0] as i16) | ((chunk[1] as i16) << 8))
-        .collect()
+    let n = u8_data.len() / core::mem::size_of::<Sample>();
+    let mut out = vec![0i16; n];
+    let _ = bytes_to_samples_into(u8_data, &mut out);
+    out
 }

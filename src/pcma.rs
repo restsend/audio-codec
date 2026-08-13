@@ -1,4 +1,4 @@
-use super::{Decoder, Encoder, PcmBuf, Sample};
+use super::{CodecError, Decoder, Encoder, Sample};
 
 const SEG_SHIFT: i16 = 4;
 const QUANT_MASK: i16 = 0x0F;
@@ -97,8 +97,18 @@ impl PcmaDecoder {
 }
 
 impl Decoder for PcmaDecoder {
-    fn decode(&mut self, samples: &[u8]) -> PcmBuf {
-        samples.iter().map(|&sample| decode_a_law(sample)).collect()
+    fn decode_into(&mut self, data: &[u8], out: &mut [Sample]) -> Result<usize, CodecError> {
+        if out.len() < data.len() {
+            return Err(CodecError::BufferTooSmall);
+        }
+        for (i, &sample) in data.iter().enumerate() {
+            out[i] = decode_a_law(sample);
+        }
+        Ok(data.len())
+    }
+
+    fn max_decode_samples(&self, n_bytes: usize) -> usize {
+        n_bytes
     }
 
     fn sample_rate(&self) -> u32 {
@@ -133,11 +143,18 @@ impl PcmaEncoder {
 }
 
 impl Encoder for PcmaEncoder {
-    fn encode(&mut self, samples: &[Sample]) -> Vec<u8> {
-        samples
-            .iter()
-            .map(|&sample| self.linear2alaw(sample))
-            .collect()
+    fn encode_into(&mut self, samples: &[Sample], out: &mut [u8]) -> Result<usize, CodecError> {
+        if out.len() < samples.len() {
+            return Err(CodecError::BufferTooSmall);
+        }
+        for (i, &sample) in samples.iter().enumerate() {
+            out[i] = self.linear2alaw(sample);
+        }
+        Ok(samples.len())
+    }
+
+    fn max_encode_bytes(&self, n_samples: usize) -> usize {
+        n_samples
     }
 
     fn sample_rate(&self) -> u32 {

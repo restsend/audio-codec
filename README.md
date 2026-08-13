@@ -4,19 +4,20 @@ A collection of VoIP audio codecs implemented for Rust. This crate provides a un
 
 ## Supported Codecs
 
-| Codec | Implementation | Feature |
-|-------|----------------|---------|
-| **G.711 (PCMA/PCMU)** | Pure Rust | Built-in |
-| **G.722** | Pure Rust | Built-in |
-| **G.729** | Pure Rust (`g729-sys`) | Built-in |
-| **Opus** | Pure Rust (`opus-rs`) | `opus` (default) |
-| **Telephone Event** | RFC 4733 | Built-in |
+| Codec | Implementation | Feature | `no_std` |
+|-------|----------------|---------|----------|
+| **G.711 (PCMA/PCMU)** | Pure Rust | Built-in | yes |
+| **G.722** | Pure Rust | Built-in | yes |
+| **G.729** | Pure Rust (`g729-sys`) | Built-in | yes |
+| **Opus** | Pure Rust (`opus-rs`) | `opus` (off by default) | no |
+| **Telephone Event** | RFC 4733 | Built-in | yes |
+| **Resampler** | Polyphase FIR | Built-in | yes |
 
 ## Features
 
 - **Unified API**: Simple `Encoder` and `Decoder` traits for all codecs.
+- **`no_std` support**: every codec except Opus runs without `std` or an allocator.
 - **Resampler**: Built-in audio resampling utility.
-- **Lightweight**: Minimal dependencies for core codecs.
 
 ## Performance
 
@@ -38,7 +39,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-audio-codec = "0.3"
+audio-codec = { version = "0.4", features = ["opus"] }   # opus is opt-in
 ```
 
 ### Example: Decoding PCMA
@@ -91,6 +92,68 @@ fn main() {
     println!("Decoded {} samples", decoded_pcm.len());
 }
 ```
+
+## `no_std` support
+
+The crate works on bare-metal targets with **no allocator** (e.g.
+Cortex-M, RISC-V). Disable the default `std` feature and use the slice-based
+`*_into` API:
+
+```toml
+[dependencies.audio-codec]
+version = "0.4"
+default-features = false
+```
+
+```rust
+use audio_codec::{Encoder, Decoder, CodecError, g722};
+
+fn g722_roundtrip(
+    encoder: &mut g722::G722Encoder,
+    decoder: &mut g722::G722Decoder,
+    pcm: &[i16],
+) -> Result<usize, CodecError> {
+    // Caller-provided scratch buffers — no allocation.
+    let mut enc_buf = [0u8; 160];           // 20ms @ 16kHz = 160 bytes
+    let mut dec_buf = [0i16; 320];
+
+    let n = encoder.encode_into(pcm, &mut enc_buf)?;
+    let m = decoder.decode_into(&enc_buf[..n], &mut dec_buf)?;
+    Ok(m)
+}
+```
+
+Use `max_encode_bytes` / `max_decode_samples` to size the buffers correctly:
+
+```rust
+let needed_bytes = encoder.max_encode_bytes(pcm.len());
+let needed_samples = decoder.max_decode_samples(n_bytes);
+```
+
+### Resampler in `no_std`
+
+`Resampler` borrows a caller-provided coefficient buffer (~24 KB):
+
+```rust
+use audio_codec::resampler::{Resampler, COEFFS_LEN};
+
+let mut coeffs: [f32; COEFFS_LEN] = [0.0; COEFFS_LEN];
+let mut r = Resampler::new(8000, 16000, &mut coeffs)?;
+
+let mut out = [0i16; 160];
+let n = r.resample_into(&input[..80], &mut out)?;
+```
+
+### Supported codecs in `no_std`
+
+| Codec | Status |
+|-------|--------|
+| G.711 (PCMA/PCMU), G.722, G.729, Telephone Event | ✅ fully supported |
+| Resampler | ✅ fully supported (borrowed coeffs buffer) |
+| Opus | ❌ requires `std` (opt-in via the `opus` feature) |
+
+The crate is verified to compile on `thumbv7em-none-eabi` and other bare-metal
+targets. Float math in the resampler goes through `libm` when `std` is off.
 
 ## License
 

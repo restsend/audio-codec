@@ -1,4 +1,4 @@
-use super::{Decoder, Encoder, PcmBuf, Sample};
+use super::{CodecError, Decoder, Encoder, PcmBuf, Sample};
 pub use opus_rs::Application as OpusApplication;
 use opus_rs::{Application, OpusDecoder as OpusDecoderRaw, OpusEncoder as OpusEncoderRaw};
 
@@ -30,7 +30,9 @@ impl OpusDecoder {
         Self::new(48000, 2)
     }
 
-    pub fn decode_into(&mut self, data: &[u8], output: &mut [i16]) -> usize {
+    /// Lower-level decode that does not perform the stereo→mono downmix.
+    /// Used internally by both the trait impl and the back-comat `decode`.
+    pub fn decode_into_raw(&mut self, data: &[u8], output: &mut [i16]) -> usize {
         if data.is_empty() {
             return 0;
         }
@@ -82,6 +84,36 @@ impl OpusDecoder {
 }
 
 impl Decoder for OpusDecoder {
+    fn decode_into(&mut self, data: &[u8], out: &mut [Sample]) -> Result<usize, CodecError> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let n = self.decode_into_raw(data, out);
+        if n == 0 {
+            Err(CodecError::DecodeFailed)
+        } else {
+            Ok(n)
+        }
+    }
+
+    fn max_decode_samples(&self, n_bytes: usize) -> usize {
+        // One 20ms frame per packet is the typical case; size for stereo
+        // to cover the worst case (caller may downmix afterwards).
+        let frame_size = (self.sample_rate as usize * 20) / 1000;
+        let _ = n_bytes;
+        frame_size * 2
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    /// Override the default to preserve back-comat stereo→mono downmix
+    /// when the decoder was configured with `channels == 2`.
     fn decode(&mut self, data: &[u8]) -> PcmBuf {
         if data.is_empty() {
             return Vec::new();
@@ -91,7 +123,7 @@ impl Decoder for OpusDecoder {
         let frame_size = (self.sample_rate as usize * 20) / 1000;
         let max_samples = frame_size * packet_channels;
         let mut pcm = vec![0i16; max_samples];
-        let n = self.decode_into(data, &mut pcm);
+        let n = self.decode_into_raw(data, &mut pcm);
         pcm.truncate(n);
         if usize::from(self.channels) == 2 {
             pcm = pcm
@@ -100,14 +132,6 @@ impl Decoder for OpusDecoder {
                 .collect();
         }
         pcm
-    }
-
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    fn channels(&self) -> u16 {
-        self.channels
     }
 }
 
@@ -173,8 +197,9 @@ impl OpusEncoder {
 
     /// Encode into a caller-provided packet buffer.
     ///
-    /// Returns `Some(bytes_written)` on success.
-    pub fn encode_into(&mut self, samples: &[Sample], output: &mut [u8]) -> Option<usize> {
+    /// Returns `Some(bytes_written)` on success. Expects `samples` to match
+    /// the encoder's channel count (interleaved stereo when `channels == 2`).
+    pub fn encode_into_raw(&mut self, samples: &[Sample], output: &mut [u8]) -> Option<usize> {
         let channels = usize::from(self.channels);
         if samples.is_empty() || channels == 0 || samples.len() % channels != 0 {
             return None;
@@ -233,6 +258,34 @@ impl OpusEncoder {
 }
 
 impl Encoder for OpusEncoder {
+    fn encode_into(&mut self, samples: &[Sample], out: &mut [u8]) -> Result<usize, CodecError> {
+        if samples.is_empty() {
+            return Ok(0);
+        }
+        // Note: this expects `samples` to already match the encoder's channel
+        // count (interleaved stereo if `channels == 2`). For the legacy
+        // mono→stereo upmix behavior, use the std-only `encode` method.
+        match self.encode_into_raw(samples, out) {
+            Some(n) => Ok(n),
+            None => Err(CodecError::EncodeFailed),
+        }
+    }
+
+    fn max_encode_bytes(&self, _n_samples: usize) -> usize {
+        // Per RFC 6716 the maximum Opus packet size is 1275 bytes.
+        1275
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    /// Override the default to preserve back-comat mono→stereo upmix
+    /// when the encoder was configured with `channels == 2`.
     fn encode(&mut self, samples: &[Sample]) -> Vec<u8> {
         if self.channels == 2 {
             let mut stereo = std::mem::take(&mut self.w_stereo);
@@ -246,14 +299,6 @@ impl Encoder for OpusEncoder {
             return out;
         }
         self.encode_raw(samples)
-    }
-
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    fn channels(&self) -> u16 {
-        self.channels
     }
 }
 

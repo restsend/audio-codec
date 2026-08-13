@@ -1,4 +1,7 @@
-use super::{Decoder, Encoder, PcmBuf, Sample};
+use super::{CodecError, Decoder, Encoder, Sample};
+
+#[cfg(feature = "std")]
+use super::PcmBuf;
 
 pub enum Bitrate {
     Mode1_64000,
@@ -271,12 +274,58 @@ impl G722Encoder {
 
     /// Encode 16-bit PCM samples into G.722 format
     /// This function follows the G.722 standard algorithm exactly
-    fn g722_encode(&mut self, amp: &[i16]) -> Vec<u8> {
-        // Pre-allocate output buffer with appropriate capacity
-        let mut output = Vec::with_capacity(amp.len() / 2 + 1);
+    fn g722_encode_into(
+        &mut self,
+        amp: &[i16],
+        out: &mut [u8],
+    ) -> Result<usize, CodecError> {
+        // Cursor over `out`. We track a byte position plus a sub-byte bit
+        // buffer used only in packed mode. The cursor returns an error if
+        // `out` cannot accept another byte.
+        struct OutCursor<'a> {
+            buf: &'a mut [u8],
+            byte_pos: usize,
+            bit_buffer: u32,
+            bit_count: i32,
+        }
+        impl<'a> OutCursor<'a> {
+            #[inline]
+            fn push_byte(&mut self, b: u8) -> Result<(), CodecError> {
+                if self.byte_pos >= self.buf.len() {
+                    return Err(CodecError::BufferTooSmall);
+                }
+                self.buf[self.byte_pos] = b;
+                self.byte_pos += 1;
+                Ok(())
+            }
+        }
 
-        // Initialize processing variables
-        let mut input_idx = 0;
+        let packed = self.packed;
+        let bits_per_sample = self.bits_per_sample;
+        let mut cursor = OutCursor {
+            buf: out,
+            byte_pos: 0,
+            bit_buffer: self.out_buffer,
+            bit_count: self.out_bits,
+        };
+
+        // Helper closure: write one `bits_per_sample`-bit code.
+        let output_code = |code: i32, cursor: &mut OutCursor<'_>| -> Result<(), CodecError> {
+            if packed {
+                cursor.bit_buffer |= (code as u32) << cursor.bit_count;
+                cursor.bit_count += bits_per_sample;
+                if cursor.bit_count >= 8 {
+                    cursor.push_byte((cursor.bit_buffer & 0xFF) as u8)?;
+                    cursor.bit_count -= 8;
+                    cursor.bit_buffer >>= 8;
+                }
+            } else {
+                cursor.push_byte(code as u8)?;
+            }
+            Ok(())
+        };
+
+        let mut input_idx = 0usize;
 
         if self.eight_k {
             while input_idx < amp.len() {
@@ -286,7 +335,7 @@ impl G722Encoder {
 
                 // 8kHz mode - only low band matters
                 let code = self.encode_low_band(xlow, true);
-                self.output_code(code, &mut output);
+                output_code(code, &mut cursor)?;
             }
         } else {
             // Process all input samples in 16kHz mode
@@ -340,7 +389,7 @@ impl G722Encoder {
                 let code = (ihigh << 6 | ilow) >> (8 - self.bits_per_sample);
 
                 // Output the encoded code
-                self.output_code(code, &mut output);
+                output_code(code, &mut cursor)?;
             }
 
             if !rem.is_empty() {
@@ -378,16 +427,20 @@ impl G722Encoder {
                 let ilow = self.encode_low_band(xlow, false);
                 let ihigh = self.encode_high_band(xhigh);
                 let code = (ihigh << 6 | ilow) >> (8 - self.bits_per_sample);
-                self.output_code(code, &mut output);
+                output_code(code, &mut cursor)?;
             }
         }
 
         // Handle any remaining bits in the output buffer
-        if self.packed && self.out_bits > 0 {
-            output.push((self.out_buffer & 0xFF) as u8);
+        if self.packed && cursor.bit_count > 0 {
+            cursor.push_byte((cursor.bit_buffer & 0xFF) as u8)?;
         }
 
-        output
+        // Persist bit buffer state for streaming across calls.
+        self.out_buffer = cursor.bit_buffer;
+        self.out_bits = cursor.bit_count;
+
+        Ok(cursor.byte_pos)
     }
 
     /// Encode low band sample and update state
@@ -495,24 +548,6 @@ impl G722Encoder {
         ihigh
     }
 
-    /// Add encoded bits to the output buffer
-    fn output_code(&mut self, code: i32, output: &mut Vec<u8>) {
-        if self.packed {
-            // Pack the code bits across byte boundaries
-            self.out_buffer |= (code as u32) << self.out_bits;
-            self.out_bits += self.bits_per_sample;
-
-            // When we have at least 8 bits, output a byte
-            if self.out_bits >= 8 {
-                output.push((self.out_buffer & 0xFF) as u8);
-                self.out_bits -= 8;
-                self.out_buffer >>= 8;
-            }
-        } else {
-            // Direct byte-aligned output
-            output.push(code as u8);
-        }
-    }
 }
 
 impl G722Decoder {
@@ -697,18 +732,29 @@ impl G722Decoder {
         [saturate(xout1 >> 11) as i16, saturate(xout2 >> 11) as i16]
     }
 
-    /// Decodes a G.722 frame and returns PCM samples
-    /// This is the main decoding function that processes G.722 encoded data
-    pub fn decode_frame(&mut self, data: &[u8]) -> PcmBuf {
-        let mut output = Vec::with_capacity(data.len() * 2);
-        let mut idx = 0;
+    /// Decodes a G.722 frame into the caller-provided buffer.
+    ///
+    /// Returns the number of samples written to `out`. Returns
+    /// [`CodecError::BufferTooSmall`] if `out` cannot accept all decoded
+    /// samples.
+    pub fn decode_frame_into(
+        &mut self,
+        data: &[u8],
+        out: &mut [Sample],
+    ) -> Result<usize, CodecError> {
+        let mut written = 0usize;
+        let mut idx = 0usize;
 
         if self.eight_k {
             while idx < data.len() {
                 let code = self.extract_code(data, &mut idx);
                 let (wd1, _, wd2) = self.parse_code(code);
                 let rlow = self.process_low_band(wd1, wd2);
-                output.push((rlow << 1) as i16);
+                if written >= out.len() {
+                    return Err(CodecError::BufferTooSmall);
+                }
+                out[written] = (rlow << 1) as i16;
+                written += 1;
             }
         } else {
             while idx < data.len() {
@@ -717,16 +763,59 @@ impl G722Decoder {
                 let rlow = self.process_low_band(wd1, wd2);
                 let rhigh = self.process_high_band(ihigh);
                 let pcm = self.apply_qmf_synthesis(rlow, rhigh);
-                output.extend_from_slice(&pcm);
+                if out.len() < written + 2 {
+                    return Err(CodecError::BufferTooSmall);
+                }
+                out[written] = pcm[0];
+                out[written + 1] = pcm[1];
+                written += 2;
             }
         }
-        output
+        Ok(written)
+    }
+
+    /// Decodes a G.722 frame into a freshly-allocated `Vec`.
+    ///
+    /// Only available with the `std` feature.
+    #[cfg(feature = "std")]
+    pub fn decode_frame(&mut self, data: &[u8]) -> PcmBuf {
+        let max = self.max_decode_samples(data.len());
+        let mut out = vec![0i16; max];
+        match self.decode_frame_into(data, &mut out) {
+            Ok(n) => {
+                out.truncate(n);
+                out
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+impl Default for G722Encoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for G722Decoder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl Encoder for G722Encoder {
-    fn encode(&mut self, samples: &[Sample]) -> Vec<u8> {
-        self.g722_encode(samples)
+    fn encode_into(&mut self, samples: &[Sample], out: &mut [u8]) -> Result<usize, CodecError> {
+        self.g722_encode_into(samples, out)
+    }
+
+    fn max_encode_bytes(&self, n_samples: usize) -> usize {
+        // Non-packed: one byte per 16kHz code. 8kHz mode emits one byte per
+        // sample. Use the larger bound so the caller always allocates enough.
+        if self.eight_k {
+            n_samples + 1
+        } else {
+            n_samples / 2 + 1
+        }
     }
 
     fn sample_rate(&self) -> u32 {
@@ -739,8 +828,18 @@ impl Encoder for G722Encoder {
 }
 
 impl Decoder for G722Decoder {
-    fn decode(&mut self, data: &[u8]) -> PcmBuf {
-        self.decode_frame(data)
+    fn decode_into(&mut self, data: &[u8], out: &mut [Sample]) -> Result<usize, CodecError> {
+        self.decode_frame_into(data, out)
+    }
+
+    fn max_decode_samples(&self, n_bytes: usize) -> usize {
+        // 16kHz mode: 2 samples per byte. 8kHz mode: 1 sample per byte.
+        // Use the larger bound so callers always size the buffer adequately.
+        if self.eight_k {
+            n_bytes
+        } else {
+            n_bytes * 2
+        }
     }
 
     fn sample_rate(&self) -> u32 {

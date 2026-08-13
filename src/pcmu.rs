@@ -1,4 +1,4 @@
-use super::{Decoder, Encoder, PcmBuf, Sample};
+use super::{CodecError, Decoder, Encoder, Sample};
 
 const BIAS: i16 = 0x84;
 const CLIP: i16 = 32635;
@@ -88,8 +88,18 @@ impl PcmuDecoder {
 }
 
 impl Decoder for PcmuDecoder {
-    fn decode(&mut self, data: &[u8]) -> PcmBuf {
-        data.iter().map(|&sample| decode_mu_law(sample)).collect()
+    fn decode_into(&mut self, data: &[u8], out: &mut [Sample]) -> Result<usize, CodecError> {
+        if out.len() < data.len() {
+            return Err(CodecError::BufferTooSmall);
+        }
+        for (i, &sample) in data.iter().enumerate() {
+            out[i] = decode_mu_law(sample);
+        }
+        Ok(data.len())
+    }
+
+    fn max_decode_samples(&self, n_bytes: usize) -> usize {
+        n_bytes
     }
 
     fn sample_rate(&self) -> u32 {
@@ -119,11 +129,18 @@ impl PcmuEncoder {
 }
 
 impl Encoder for PcmuEncoder {
-    fn encode(&mut self, samples: &[Sample]) -> Vec<u8> {
-        samples
-            .iter()
-            .map(|&sample| self.linear2ulaw(sample))
-            .collect()
+    fn encode_into(&mut self, samples: &[Sample], out: &mut [u8]) -> Result<usize, CodecError> {
+        if out.len() < samples.len() {
+            return Err(CodecError::BufferTooSmall);
+        }
+        for (i, &sample) in samples.iter().enumerate() {
+            out[i] = self.linear2ulaw(sample);
+        }
+        Ok(samples.len())
+    }
+
+    fn max_encode_bytes(&self, n_samples: usize) -> usize {
+        n_samples
     }
 
     fn sample_rate(&self) -> u32 {
