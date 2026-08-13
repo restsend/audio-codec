@@ -1,5 +1,10 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+// Opus wraps the (large, ~260 KB) opus-rs encoder/decoder on the heap, so it
+// needs `alloc` even in `no_std`.
+#[cfg(all(not(feature = "std"), feature = "opus"))]
+extern crate alloc;
+
 pub use error::CodecError;
 
 pub mod error;

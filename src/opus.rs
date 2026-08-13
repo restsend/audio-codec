@@ -1,27 +1,43 @@
-use super::{CodecError, Decoder, Encoder, PcmBuf, Sample};
+use super::{CodecError, Decoder, Encoder, Sample};
+#[cfg(feature = "std")]
+use super::PcmBuf;
+// `Box` lives in the std prelude; under `no_std` it comes from `alloc`.
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
 pub use opus_rs::Application as OpusApplication;
 use opus_rs::{Application, OpusDecoder as OpusDecoderRaw, OpusEncoder as OpusEncoderRaw};
 
+// Heap-free scratch-buffer caps (worst case: 48 kHz, stereo, 20 ms frame).
+const OPUS_MAX_FRAME: usize = 960; // 20 ms @ 48 kHz per channel
+const OPUS_MAX_CHANNELS: usize = 2;
+const OPUS_MAX_SAMPLES: usize = OPUS_MAX_FRAME * OPUS_MAX_CHANNELS; // 1920
+// RFC 6716: a single Opus packet carries at most 1276 bytes. Used by the
+// std-only `encode` helper's scratch packet buffer.
+#[cfg(feature = "std")]
+const OPUS_MAX_PACKET: usize = 1276;
+
 pub struct OpusDecoder {
-    decoder: OpusDecoderRaw,
+    decoder: Box<OpusDecoderRaw>,
     sample_rate: u32,
     channels: u16,
-    w_output_f32: Vec<f32>,
-    w_pcm_i16: Vec<i16>,
+    w_output_f32: [f32; OPUS_MAX_SAMPLES],
+    w_pcm_i16: [i16; OPUS_MAX_SAMPLES],
 }
 
 impl OpusDecoder {
     /// Create a new Opus decoder instance
     pub fn new(sample_rate: u32, channels: u16) -> Self {
-        let decoder = OpusDecoderRaw::new(sample_rate as i32, channels as usize)
-            .expect("Failed to create Opus decoder");
+        let decoder = Box::new(
+            OpusDecoderRaw::new(sample_rate as i32, channels as usize)
+                .expect("Failed to create Opus decoder"),
+        );
 
         Self {
             decoder,
             sample_rate,
             channels,
-            w_output_f32: Vec::new(),
-            w_pcm_i16: Vec::new(),
+            w_output_f32: [0.0; OPUS_MAX_SAMPLES],
+            w_pcm_i16: [0; OPUS_MAX_SAMPLES],
         }
     }
 
@@ -44,16 +60,14 @@ impl OpusDecoder {
         let packet_channels = if data[0] & 0x04 != 0 { 2usize } else { 1 };
         if self.channels as usize != packet_channels {
             self.channels = packet_channels as u16;
-            self.decoder = OpusDecoderRaw::new(self.sample_rate as i32, packet_channels)
+            // Reuse the existing heap allocation (see `clippy::replace_box`).
+            *self.decoder = OpusDecoderRaw::new(self.sample_rate as i32, packet_channels)
                 .expect("Failed to create Opus decoder");
         }
 
         let channels = usize::from(self.channels);
         let frame_size = (self.sample_rate as usize * 20) / 1000;
         let max_samples = frame_size * channels;
-        if self.w_output_f32.len() < max_samples {
-            self.w_output_f32.resize(max_samples, 0.0);
-        }
 
         match self
             .decoder
@@ -63,10 +77,6 @@ impl OpusDecoder {
                 let total_samples = len * channels;
                 if total_samples == 0 {
                     return 0;
-                }
-
-                if self.w_pcm_i16.len() < total_samples {
-                    self.w_pcm_i16.resize(total_samples, 0);
                 }
 
                 for i in 0..total_samples {
@@ -114,6 +124,7 @@ impl Decoder for OpusDecoder {
 
     /// Override the default to preserve back-comat stereo→mono downmix
     /// when the decoder was configured with `channels == 2`.
+    #[cfg(feature = "std")]
     fn decode(&mut self, data: &[u8]) -> PcmBuf {
         if data.is_empty() {
             return Vec::new();
@@ -136,28 +147,24 @@ impl Decoder for OpusDecoder {
 }
 
 pub struct OpusEncoder {
-    encoder: OpusEncoderRaw,
+    encoder: Box<OpusEncoderRaw>,
     sample_rate: u32,
     channels: u16,
-    w_input_f32: Vec<f32>,
-    w_packet: Vec<u8>,
-    /// Reusable buffer for mono→stereo upmix.  Avoids a per-frame allocation
-    /// in `encode()` when `channels == 2`.
-    w_stereo: Vec<i16>,
+    w_input_f32: [f32; OPUS_MAX_SAMPLES],
 }
 
 impl OpusEncoder {
     pub fn new_with_application(sample_rate: u32, channels: u16, application: Application) -> Self {
-        let encoder = OpusEncoderRaw::new(sample_rate as i32, channels as usize, application)
-            .expect("Failed to create Opus encoder");
+        let encoder = Box::new(
+            OpusEncoderRaw::new(sample_rate as i32, channels as usize, application)
+                .expect("Failed to create Opus encoder"),
+        );
 
         Self {
             encoder,
             sample_rate,
             channels,
-            w_input_f32: Vec::new(),
-            w_packet: vec![0u8; 1275],
-            w_stereo: Vec::new(),
+            w_input_f32: [0.0; OPUS_MAX_SAMPLES],
         }
     }
 
@@ -201,15 +208,15 @@ impl OpusEncoder {
     /// the encoder's channel count (interleaved stereo when `channels == 2`).
     pub fn encode_into_raw(&mut self, samples: &[Sample], output: &mut [u8]) -> Option<usize> {
         let channels = usize::from(self.channels);
-        if samples.is_empty() || channels == 0 || samples.len() % channels != 0 {
+        if samples.is_empty() || channels == 0 || !samples.len().is_multiple_of(channels) {
+            return None;
+        }
+        // Fixed scratch cap (heap-free build).
+        if samples.len() > OPUS_MAX_SAMPLES {
             return None;
         }
 
         let frame_size = samples.len() / channels;
-
-        if self.w_input_f32.len() < samples.len() {
-            self.w_input_f32.resize(samples.len(), 0.0);
-        }
 
         for (dst, &s) in self.w_input_f32[..samples.len()]
             .iter_mut()
@@ -223,17 +230,18 @@ impl OpusEncoder {
             .ok()
     }
 
+    #[cfg(feature = "std")]
     fn encode_raw(&mut self, samples: &[Sample]) -> Vec<u8> {
         let channels = usize::from(self.channels);
-        if samples.is_empty() || channels == 0 || samples.len() % channels != 0 {
+        if samples.is_empty()
+            || channels == 0
+            || !samples.len().is_multiple_of(channels)
+            || samples.len() > OPUS_MAX_SAMPLES
+        {
             return Vec::new();
         }
 
         let frame_size = samples.len() / channels;
-
-        if self.w_input_f32.len() < samples.len() {
-            self.w_input_f32.resize(samples.len(), 0.0);
-        }
 
         for (dst, &s) in self.w_input_f32[..samples.len()]
             .iter_mut()
@@ -242,16 +250,13 @@ impl OpusEncoder {
             *dst = s as f32 / 32768.0;
         }
 
+        let mut packet = [0u8; OPUS_MAX_PACKET];
         match self.encoder.encode(
             &self.w_input_f32[..samples.len()],
             frame_size,
-            &mut self.w_packet,
+            &mut packet,
         ) {
-            Ok(len) => {
-                let mut out = Vec::with_capacity(len);
-                out.extend_from_slice(&self.w_packet[..len]);
-                out
-            }
+            Ok(len) => packet[..len].to_vec(),
             Err(_) => Vec::new(),
         }
     }
@@ -286,17 +291,19 @@ impl Encoder for OpusEncoder {
 
     /// Override the default to preserve back-comat mono→stereo upmix
     /// when the encoder was configured with `channels == 2`.
+    #[cfg(feature = "std")]
     fn encode(&mut self, samples: &[Sample]) -> Vec<u8> {
         if self.channels == 2 {
-            let mut stereo = std::mem::take(&mut self.w_stereo);
-            stereo.resize(samples.len() * 2, 0);
+            // mono→stereo upmix into a local scratch buffer (no allocation).
+            if samples.len() > OPUS_MAX_FRAME {
+                return Vec::new();
+            }
+            let mut stereo = [0i16; OPUS_MAX_SAMPLES];
             for (i, &sample) in samples.iter().enumerate() {
                 stereo[2 * i] = sample;
                 stereo[2 * i + 1] = sample;
             }
-            let out = self.encode_raw(&stereo);
-            self.w_stereo = stereo;
-            return out;
+            return self.encode_raw(&stereo[..samples.len() * 2]);
         }
         self.encode_raw(samples)
     }

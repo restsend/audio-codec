@@ -6,17 +6,19 @@ A collection of VoIP audio codecs implemented for Rust. This crate provides a un
 
 | Codec | Implementation | Feature | `no_std` |
 |-------|----------------|---------|----------|
-| **G.711 (PCMA/PCMU)** | Pure Rust | Built-in | yes |
-| **G.722** | Pure Rust | Built-in | yes |
-| **G.729** | Pure Rust (`g729-sys`) | Built-in | yes |
-| **Opus** | Pure Rust (`opus-rs`) | `opus` (off by default) | no |
-| **Telephone Event** | RFC 4733 | Built-in | yes |
-| **Resampler** | Polyphase FIR | Built-in | yes |
+| **G.711 (PCMA/PCMU)** | Pure Rust | Built-in | yes (heap-free) |
+| **G.722** | Pure Rust | Built-in | yes (heap-free) |
+| **G.729** | Pure Rust (`g729-sys`) | Built-in | yes (heap-free) |
+| **Opus** | Pure Rust (`opus-rs`) | `opus` (on by default) | yes (needs `alloc`) |
+| **Telephone Event** | RFC 4733 | Built-in | yes (heap-free) |
+| **Resampler** | Polyphase FIR | Built-in | yes (heap-free) |
 
 ## Features
 
 - **Unified API**: Simple `Encoder` and `Decoder` traits for all codecs.
-- **`no_std` support**: every codec except Opus runs without `std` or an allocator.
+- **`no_std` support**: every codec runs without `std`. G.711/G.722/G.729, the
+  resampler and telephone-event are fully **heap-free** (no allocator needed);
+  Opus needs an `alloc` (its internal working set is ~250 KB and is boxed).
 - **Resampler**: Built-in audio resampling utility.
 
 ## Performance
@@ -39,7 +41,14 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-audio-codec = { version = "0.4", features = ["opus"] }   # opus is opt-in
+audio-codec = "0.4"   # Opus is enabled by default
+```
+
+To opt out of Opus (smaller build, no `alloc` needed):
+
+```toml
+[dependencies]
+audio-codec = { version = "0.4", default-features = false, features = ["std"] }
 ```
 
 ### Example: Decoding PCMA
@@ -95,9 +104,10 @@ fn main() {
 
 ## `no_std` support
 
-The crate works on bare-metal targets with **no allocator** (e.g.
-Cortex-M, RISC-V). Disable the default `std` feature and use the slice-based
-`*_into` API:
+The crate works on bare-metal targets with **no `std`**. G.711/G.722/G.729, the
+resampler and telephone-event are additionally **heap-free** (no allocator);
+Opus needs an `alloc` because its encoder/decoder working set (~250 KB) is
+boxed. Disable the default `std` feature and use the slice-based `*_into` API:
 
 ```toml
 [dependencies.audio-codec]
@@ -144,16 +154,36 @@ let mut out = [0i16; 160];
 let n = r.resample_into(&input[..80], &mut out)?;
 ```
 
+### Opus in `no_std`
+
+Opus also works without `std` (it needs an `alloc` — the encoder/decoder are
+boxed). Use the slice-based `*_into` API exactly like the other codecs:
+
+```rust
+use audio_codec::{Encoder, Decoder, opus::{OpusEncoder, OpusDecoder}};
+
+// 48 kHz, mono. The structs are boxed internally, so this only needs `alloc`.
+let mut encoder = OpusEncoder::new(48_000, 1);
+let mut decoder = OpusDecoder::new(48_000, 1);
+
+let pcm: &[i16] = /* 20 ms @ 48 kHz = 960 mono samples */;
+let mut packet = [0u8; 1275];
+let n = encoder.encode_into(pcm, &mut packet)?;
+
+let mut out = [0i16; 960];
+let m = decoder.decode_into(&packet[..n], &mut out)?;
+```
+
 ### Supported codecs in `no_std`
 
 | Codec | Status |
 |-------|--------|
-| G.711 (PCMA/PCMU), G.722, G.729, Telephone Event | ✅ fully supported |
-| Resampler | ✅ fully supported (borrowed coeffs buffer) |
-| Opus | ❌ requires `std` (opt-in via the `opus` feature) |
+| G.711 (PCMA/PCMU), G.722, G.729, Telephone Event | ✅ fully heap-free (no allocator) |
+| Resampler | ✅ fully heap-free (borrowed coeffs buffer) |
+| Opus | ✅ supported (needs `alloc`; encoder/decoder are boxed) |
 
 The crate is verified to compile on `thumbv7em-none-eabi` and other bare-metal
-targets. Float math in the resampler goes through `libm` when `std` is off.
+targets. Float math (resampler + Opus) goes through `libm` when `std` is off.
 
 ## License
 

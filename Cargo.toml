@@ -1,6 +1,6 @@
 [package]
 name = "audio-codec"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A collection of VoIP audio codecs in pure Rust, including G.711, G.722, G.729, and Opus."
@@ -11,17 +11,22 @@ keywords = ["sip", "voip", "telephony", "webrtc", "no_std"]
 categories = ["multimedia", "no-std"]
 
 [features]
-default = ["std"]
-std = ["dep:anyhow", "g729-sys/std"]
-opus = ["dep:opus-rs", "std"]
+default = ["std", "opus"]
+# `std` enables the allocating convenience API (`encode`/`decode` returning
+# `Vec`, `create_encoder`/`create_decoder` returning `Box`, ...). Without it
+# the crate is `#![no_std]`; Opus then needs an `alloc` (its ~250 KB
+# encoder/decoder working set is boxed), the other codecs are heap-free.
+std = ["g729-sys/std", "opus-rs?/std"]
+# Opus support. On by default. opus-rs uses `libm` for transcendentals when
+# `std` is off (no_std build).
+opus = ["dep:opus-rs", "opus-rs/libm"]
 
 [lib]
 crate-type = ["rlib"]
 
 [dependencies]
-anyhow = { version = "1", optional = true }
 g729-sys = { version = "0.2", default-features = false }
-opus-rs = { version = "0.1.26", optional = true }
+opus-rs = { version = "0.1.27", optional = true, default-features = false }
 libm = { version = "0.2", default-features = false }
 
 [dev-dependencies]
