@@ -1,13 +1,13 @@
 [package]
 name = "audio-codec"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A collection of VoIP audio codecs in pure Rust, including G.711, G.722, G.729, and Opus."
 license = "MIT"
 repository = "https://github.com/restsend/audio-codec"
 readme = "README.md"
-keywords = ["sip", "voip", "telephony", "webrtc", "no_std"]
+keywords = ["sip", "voip", "telephony", "webrtc", "no-std"]
 categories = ["multimedia", "no-std"]
 
 [features]
@@ -16,7 +16,13 @@ default = ["std", "opus"]
 # `Vec`, `create_encoder`/`create_decoder` returning `Box`, ...). Without it
 # the crate is `#![no_std]`; Opus then needs an `alloc` (its ~250 KB
 # encoder/decoder working set is boxed), the other codecs are heap-free.
-std = ["g729-sys/std", "opus-rs?/std"]
+#
+# `std` also enables opus-rs's `heap` feature (requires std there): the
+# encoder/decoder codec states are constructed INSIDE a Box instead of on
+# the caller's stack. OpusEncoder's inline state is ~250 KB without it, so
+# `OpusEncoder::new` alone could consume most of an 8 MB thread stack —
+# fatal for deep async call chains in debug builds.
+std = ["g729-sys/std", "opus-rs?/std", "opus-rs?/heap"]
 # Opus support. On by default. opus-rs uses `libm` for transcendentals when
 # `std` is off (no_std build).
 opus = ["dep:opus-rs", "opus-rs/libm"]
@@ -26,7 +32,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 g729-sys = { version = "0.2", default-features = false }
-opus-rs = { version = "0.1.28", optional = true, default-features = false }
+opus-rs = { version = "0.1.29", optional = true, default-features = false }
 libm = { version = "0.2", default-features = false }
 
 [dev-dependencies]
