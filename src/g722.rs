@@ -274,11 +274,7 @@ impl G722Encoder {
 
     /// Encode 16-bit PCM samples into G.722 format
     /// This function follows the G.722 standard algorithm exactly
-    fn g722_encode_into(
-        &mut self,
-        amp: &[i16],
-        out: &mut [u8],
-    ) -> Result<usize, CodecError> {
+    fn g722_encode_into(&mut self, amp: &[i16], out: &mut [u8]) -> Result<usize, CodecError> {
         // Cursor over `out`. We track a byte position plus a sub-byte bit
         // buffer used only in packed mode. The cursor returns an error if
         // `out` cannot accept another byte.
@@ -547,7 +543,6 @@ impl G722Encoder {
 
         ihigh
     }
-
 }
 
 impl G722Decoder {
@@ -835,11 +830,7 @@ impl Decoder for G722Decoder {
     fn max_decode_samples(&self, n_bytes: usize) -> usize {
         // 16kHz mode: 2 samples per byte. 8kHz mode: 1 sample per byte.
         // Use the larger bound so callers always size the buffer adequately.
-        if self.eight_k {
-            n_bytes
-        } else {
-            n_bytes * 2
-        }
+        if self.eight_k { n_bytes } else { n_bytes * 2 }
     }
 
     fn sample_rate(&self) -> u32 {

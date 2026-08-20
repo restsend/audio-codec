@@ -18,7 +18,9 @@ pub mod resampler;
 pub mod telephone_event;
 
 #[cfg(feature = "std")]
-pub use resampler::{Resampler, resample};
+pub use resampler::Resampler;
+#[cfg(feature = "std")]
+pub use resampler::{BoxedResampler, resample};
 
 pub type Sample = i16;
 
@@ -346,8 +348,7 @@ pub fn bytes_to_samples_into(u8_data: &[u8], out: &mut [Sample]) -> Result<usize
     #[cfg(target_endian = "little")]
     {
         // SAFETY: see `samples_to_bytes_into`.
-        let src =
-            unsafe { core::slice::from_raw_parts(u8_data.as_ptr() as *const Sample, n) };
+        let src = unsafe { core::slice::from_raw_parts(u8_data.as_ptr() as *const Sample, n) };
         out[..n].copy_from_slice(src);
     }
     #[cfg(target_endian = "big")]

@@ -326,6 +326,70 @@ pub fn resample(input: &[Sample], input_sample_rate: u32, output_sample_rate: u3
     r.resample(input)
 }
 
+/// Self-contained [`Resampler`] that owns its coefficient buffer (std only).
+///
+/// [`Resampler`] borrows a ~24 KB caller-provided coefficient slice, which
+/// makes it awkward to store as a long-lived struct field (the buffer must
+/// outlive the resampler). `BoxedResampler` heap-allocates the coefficients
+/// once and keeps them alive for the resampler's whole lifetime, restoring
+/// the pre-0.4 ergonomic `new(input_rate, output_rate)` + `resample(..)`
+/// call shape for std users that hold resamplers in struct fields.
+#[cfg(feature = "std")]
+pub struct BoxedResampler {
+    /// Heap allocation: the buffer address is stable for the box's lifetime
+    /// and never reallocated, which is what the `Resampler<'static>` borrow
+    /// below relies on. Field order matters for drop: `inner` (borrower)
+    /// must drop before `coeffs` (borrowed).
+    inner: Resampler<'static>,
+    coeffs: Box<[f32]>,
+}
+
+#[cfg(feature = "std")]
+impl BoxedResampler {
+    /// Create a resampler that owns its polyphase filter coefficients.
+    ///
+    /// Fails only for zero rates (the coefficient buffer is always sized
+    /// correctly internally).
+    pub fn new(input_rate: usize, output_rate: usize) -> Result<Self, CodecError> {
+        let mut coeffs = vec![0.0f32; COEFFS_LEN].into_boxed_slice();
+        // SAFETY: `coeffs` is a heap box whose address cannot change while
+        // the allocation lives. We extend the borrow to 'static solely to
+        // store both the buffer and its borrower in the same struct; the
+        // struct's field order drops `inner` before `coeffs`, and nothing
+        // else can reach the buffer (it is moved into `Self` right after).
+        let inner = unsafe {
+            let ptr = coeffs.as_mut_ptr();
+            let loan: &'static mut [f32] = core::slice::from_raw_parts_mut(ptr, coeffs.len());
+            Resampler::new(input_rate, output_rate, loan)?
+        };
+        Ok(Self { inner, coeffs })
+    }
+
+    /// Convenience wrapper that allocates the output buffer.
+    pub fn resample(&mut self, input: &[Sample]) -> PcmBuf {
+        self.inner.resample(input)
+    }
+
+    /// Resample into a caller-provided buffer (no allocation).
+    pub fn resample_into(
+        &mut self,
+        input: &[Sample],
+        out: &mut [Sample],
+    ) -> Result<usize, CodecError> {
+        self.inner.resample_into(input, out)
+    }
+
+    /// Upper bound on the output sample count for `n_input` input samples.
+    pub fn max_output_samples(&self, n_input: usize) -> usize {
+        self.inner.max_output_samples(n_input)
+    }
+
+    /// Reset the resampling history (e.g. after a source discontinuity).
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,6 +534,91 @@ mod tests {
             max_diff < 100,
             "Large discontinuity between chunks: max_diff={}",
             max_diff
+        );
+    }
+
+    /// `BoxedResampler` must produce byte-identical output to the borrowed
+    /// `Resampler` fed the same coefficients, and survive being moved +
+    /// reused across many calls (stable self-referential borrow).
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_boxed_resampler_matches_borrowed() {
+        let input_rate = 48000usize;
+        let output_rate = 8000usize;
+        let input: Vec<i16> = (0..4800)
+            .map(|i| ((i as f32 * 0.05).sin() * 8000.0) as i16)
+            .collect();
+
+        let expected = {
+            let mut coeffs = vec![0.0f32; COEFFS_LEN];
+            let mut borrowed = Resampler::new(input_rate, output_rate, &mut coeffs).unwrap();
+            borrowed.resample(&input)
+        };
+
+        let mut boxed = BoxedResampler::new(input_rate, output_rate).unwrap();
+        let expected_max = ((input.len() * output_rate + input_rate - 1) / input_rate) + 1;
+        assert_eq!(boxed.max_output_samples(input.len()), expected_max);
+        let got = boxed.resample(&input);
+        assert_eq!(
+            expected, got,
+            "BoxedResampler output must match borrowed Resampler"
+        );
+
+        // Reuse after move: the coefficient borrow must stay valid across
+        // moves. The resampler is a streaming state machine — a second
+        // `resample` of the same input keeps the tail of the previous run in
+        // its history, so only the output LENGTH is stable across the move.
+        let mut moved = boxed;
+        let again = moved.resample(&input);
+        assert_eq!(expected.len(), again.len());
+
+        // reset() clears the history and phase, so a fresh `resample` of the
+        // same input must reproduce the very first output exactly.
+        moved.reset();
+        let after_reset = moved.resample(&input);
+        assert_eq!(expected, after_reset);
+
+        assert!(
+            BoxedResampler::new(0, 8000).is_err(),
+            "zero input rate must error"
+        );
+        assert!(
+            BoxedResampler::new(48000, 0).is_err(),
+            "zero output rate must error"
+        );
+    }
+}
+#[cfg(test)]
+mod debug_probe2 {
+    use super::*;
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn probe_order() {
+        let input: Vec<i16> = (0..4800)
+            .map(|i| ((i as f32 * 0.05).sin() * 8000.0) as i16)
+            .collect();
+        // borrowed FIRST, then boxed — same order as the failing test
+        let expected = {
+            let mut coeffs = vec![0.0f32; COEFFS_LEN];
+            let mut r = Resampler::new(48000, 8000, &mut coeffs).unwrap();
+            r.resample(&input)
+        };
+        let mut boxed = BoxedResampler::new(48000, 8000).unwrap();
+        let got = boxed.resample(&input);
+        let diffs: Vec<usize> = expected
+            .iter()
+            .zip(got.iter())
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, _)| i)
+            .collect();
+        println!(
+            "diff_count={} first_diffs={:?} expected_len={} got_len={}",
+            diffs.len(),
+            &diffs[..diffs.len().min(8)],
+            expected.len(),
+            got.len()
         );
     }
 }

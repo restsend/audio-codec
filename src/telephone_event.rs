@@ -47,11 +47,7 @@ impl Default for TelephoneEventEncoder {
 }
 
 impl Encoder for TelephoneEventEncoder {
-    fn encode_into(
-        &mut self,
-        _samples: &[Sample],
-        _out: &mut [u8],
-    ) -> Result<usize, CodecError> {
+    fn encode_into(&mut self, _samples: &[Sample], _out: &mut [u8]) -> Result<usize, CodecError> {
         Ok(0)
     }
 

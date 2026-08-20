@@ -81,14 +81,23 @@ fn test_g722_into_roundtrip() {
 
     let max_samples = dec.max_decode_samples(n);
     let mut dec_buf = vec![0i16; max_samples];
-    let m = dec.decode_into(&enc_buf[..n], &mut dec_buf).expect("decode_into");
+    let m = dec
+        .decode_into(&enc_buf[..n], &mut dec_buf)
+        .expect("decode_into");
     assert_eq!(m, 320, "G.722 16kHz 160 bytes should decode to 320 samples");
 
     // Bit-exact round-trip is not expected from a lossy codec, but the decoded
     // signal should have reasonable energy.
-    let energy: f64 =
-        dec_buf[..m].iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / m as f64;
-    assert!(energy.sqrt() > 100.0, "decoded G.722 has no energy: {}", energy);
+    let energy: f64 = dec_buf[..m]
+        .iter()
+        .map(|&s| (s as f64).powi(2))
+        .sum::<f64>()
+        / m as f64;
+    assert!(
+        energy.sqrt() > 100.0,
+        "decoded G.722 has no energy: {}",
+        energy
+    );
 }
 
 #[test]
@@ -111,7 +120,10 @@ fn test_g729_into_roundtrip() {
     let mut dec = g729::G729Decoder::new();
 
     let max_bytes = enc.max_encode_bytes(pcm.len());
-    assert_eq!(max_bytes, 10, "G.729 80 samples should produce 10 bytes max");
+    assert_eq!(
+        max_bytes, 10,
+        "G.729 80 samples should produce 10 bytes max"
+    );
     let mut enc_buf = vec![0u8; max_bytes];
     let n = enc.encode_into(&pcm, &mut enc_buf).expect("encode_into");
     assert_eq!(n, 10);
@@ -119,7 +131,9 @@ fn test_g729_into_roundtrip() {
     let max_samples = dec.max_decode_samples(n);
     assert_eq!(max_samples, 80);
     let mut dec_buf = vec![0i16; max_samples];
-    let m = dec.decode_into(&enc_buf[..n], &mut dec_buf).expect("decode_into");
+    let m = dec
+        .decode_into(&enc_buf[..n], &mut dec_buf)
+        .expect("decode_into");
     assert_eq!(m, 80);
 }
 
@@ -156,7 +170,11 @@ fn test_resampler_into_roundtrip_via_borrowed_coeffs() {
     let mut out = vec![0i16; max];
     let n = r.resample_into(&input, &mut out).expect("resample_into");
     // 8k -> 16k should roughly double the sample count.
-    assert!(n >= 150 && n <= 170, "expected ~160 output samples, got {}", n);
+    assert!(
+        n >= 150 && n <= 170,
+        "expected ~160 output samples, got {}",
+        n
+    );
 
     // Calling resample_into with an undersized buffer must return BufferTooSmall.
     let mut tiny = [0i16; 4];

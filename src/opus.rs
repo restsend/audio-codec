@@ -1,6 +1,6 @@
-use super::{CodecError, Decoder, Encoder, Sample};
 #[cfg(feature = "std")]
 use super::PcmBuf;
+use super::{CodecError, Decoder, Encoder, Sample};
 // `Box` lives in the std prelude; under `no_std` it comes from `alloc`.
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
@@ -251,11 +251,10 @@ impl OpusEncoder {
         }
 
         let mut packet = [0u8; OPUS_MAX_PACKET];
-        match self.encoder.encode(
-            &self.w_input_f32[..samples.len()],
-            frame_size,
-            &mut packet,
-        ) {
+        match self
+            .encoder
+            .encode(&self.w_input_f32[..samples.len()], frame_size, &mut packet)
+        {
             Ok(len) => packet[..len].to_vec(),
             Err(_) => Vec::new(),
         }
