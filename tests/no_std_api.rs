@@ -159,6 +159,36 @@ fn test_byte_helpers_buffer_too_small() {
 }
 
 #[test]
+fn test_byte_helpers_empty_inputs() {
+    // Regression: an empty `out` slice has a dangling 1-aligned pointer, which
+    // used to trip the `from_raw_parts_mut` alignment precondition.
+    let n = samples_to_bytes_into(&[], &mut []).expect("s2b empty");
+    assert_eq!(n, 0);
+    let m = bytes_to_samples_into(&[], &mut []).expect("b2s empty");
+    assert_eq!(m, 0);
+}
+
+#[test]
+fn test_byte_helpers_unaligned_buffer() {
+    // Regression: a `&mut [u8]` at an odd address is not `i16`-aligned.
+    let samples: Vec<i16> = vec![0x0102, -0x0304, 0x7fff, -0x8000];
+
+    let mut buf = vec![0u8; samples.len() * 2 + 1];
+    let odd = &mut buf[1..];
+    assert!(
+        odd.as_ptr().addr() % 2 == 1,
+        "test requires an odd-addressed slice"
+    );
+    let n = samples_to_bytes_into(&samples, odd).expect("s2b unaligned");
+    assert_eq!(n, samples.len() * 2);
+
+    let mut back = vec![0i16; samples.len()];
+    let m = bytes_to_samples_into(&odd[..n], &mut back).expect("b2s unaligned");
+    assert_eq!(m, samples.len());
+    assert_eq!(&back[..m], &samples[..]);
+}
+
+#[test]
 fn test_resampler_into_roundtrip_via_borrowed_coeffs() {
     use audio_codec::resampler::{COEFFS_LEN, Resampler};
 

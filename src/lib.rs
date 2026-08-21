@@ -316,22 +316,32 @@ pub fn samples_to_bytes_into(samples: &[Sample], out: &mut [u8]) -> Result<usize
     if out.len() < needed {
         return Err(CodecError::BufferTooSmall);
     }
+    if samples.is_empty() {
+        return Ok(0);
+    }
+    // A `&mut [u8]` is only guaranteed 1-byte aligned (and an empty buffer's
+    // dangling pointer is 1-aligned), so the i16 view is only sound when the
+    // pointer happens to be properly aligned; otherwise fall back to a
+    // bytewise copy.
+    let dst_aligned = out
+        .as_mut_ptr()
+        .addr()
+        .is_multiple_of(core::mem::align_of::<Sample>());
     #[cfg(target_endian = "little")]
-    {
-        // SAFETY: `[u8; N*2]` and `[i16; N]` have the same size and alignment,
-        // and we just verified `out` is large enough.
+    if dst_aligned {
+        // SAFETY: `out` is large enough (checked above) and its pointer is
+        // aligned to `Sample`; `[u8; N*2]` and `[i16; N]` then have the same
+        // layout.
         let dst = unsafe {
             core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut Sample, samples.len())
         };
         dst.copy_from_slice(samples);
+        return Ok(needed);
     }
-    #[cfg(target_endian = "big")]
-    {
-        for (i, s) in samples.iter().enumerate() {
-            let b = s.to_le_bytes();
-            out[2 * i] = b[0];
-            out[2 * i + 1] = b[1];
-        }
+    for (i, s) in samples.iter().enumerate() {
+        let b = s.to_le_bytes();
+        out[2 * i] = b[0];
+        out[2 * i + 1] = b[1];
     }
     Ok(needed)
 }
@@ -345,17 +355,24 @@ pub fn bytes_to_samples_into(u8_data: &[u8], out: &mut [Sample]) -> Result<usize
     if out.len() < n {
         return Err(CodecError::BufferTooSmall);
     }
+    if n == 0 {
+        return Ok(0);
+    }
+    // See `samples_to_bytes_into`: a `&[u8]` is only guaranteed 1-byte
+    // aligned, so only build the i16 view when the pointer is aligned.
+    let src_aligned = u8_data
+        .as_ptr()
+        .addr()
+        .is_multiple_of(core::mem::align_of::<Sample>());
     #[cfg(target_endian = "little")]
-    {
+    if src_aligned {
         // SAFETY: see `samples_to_bytes_into`.
         let src = unsafe { core::slice::from_raw_parts(u8_data.as_ptr() as *const Sample, n) };
         out[..n].copy_from_slice(src);
+        return Ok(n);
     }
-    #[cfg(target_endian = "big")]
-    {
-        for (i, chunk) in u8_data.chunks_exact(2).enumerate() {
-            out[i] = (chunk[0] as i16) | ((chunk[1] as i16) << 8);
-        }
+    for (i, chunk) in u8_data.chunks_exact(2).enumerate() {
+        out[i] = (chunk[0] as i16) | ((chunk[1] as i16) << 8);
     }
     Ok(n)
 }
