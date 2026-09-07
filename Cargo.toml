@@ -1,6 +1,6 @@
 [package]
 name = "audio-codec"
-version = "0.4.6"
+version = "0.4.7"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A collection of VoIP audio codecs in pure Rust, including G.711, G.722, G.729, and Opus."
@@ -32,7 +32,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 g729-sys = { version = "0.2", default-features = false }
-opus-rs = { version = "0.1.32", optional = true, default-features = false }
+opus-rs = { version = "0.1.33", optional = true, default-features = false }
 libm = { version = "0.2", default-features = false }
 
 [dev-dependencies]
