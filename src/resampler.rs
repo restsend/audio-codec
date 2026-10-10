@@ -15,11 +15,6 @@ pub const COEFFS_LEN: usize = NUM_PHASES * TAPS_PER_PHASE;
 /// Fixed-point scale for the polyphase coefficients and the FIR accumulator
 /// (Q15: one unit = 1/32768).
 const Q15_SHIFT: u32 = 15;
-/// Fractional bits of the phase accumulator. The top 8 bits of the fraction
-/// select one of the 256 phases.
-const PHASE_BITS: u32 = 24;
-/// One whole input sample in phase-accumulator units (`1 << PHASE_BITS`).
-const PHASE_ONE: u32 = 1 << PHASE_BITS;
 
 /// `f64::sin` polyfill that works in both std and no_std (via libm).
 #[inline]
@@ -73,7 +68,6 @@ fn fround(x: f64) -> f64 {
 pub struct Resampler<'a> {
     input_rate: usize,
     output_rate: usize,
-    ratio: f64,
     coeffs: &'a mut [i16],
     taps_per_phase: usize,
     /// Sliding window of the last `TAPS_PER_PHASE` inputs, held in a double
@@ -83,10 +77,13 @@ pub struct Resampler<'a> {
     history: [i16; 2 * TAPS_PER_PHASE],
     /// Write cursor into `history` (`TAPS_PER_PHASE ..= 2 * TAPS_PER_PHASE`).
     w: usize,
-    /// Phase within the current input sample, Q24 (`0..PHASE_ONE`).
-    pos: u32,
-    /// Phase advance per output sample, Q24 (= `input_rate / output_rate`).
-    step: u32,
+    /// Ticks from the newest input sample to the next output sample. It can
+    /// exceed one input sample when downsampling.
+    ///
+    /// Timing runs on an integer grid of `input_rate * output_rate` ticks per
+    /// second: one input sample is `output_rate` ticks and one output sample
+    /// is `input_rate` ticks, so the timing is exact and never rounded.
+    pos: usize,
 }
 
 fn bessel_i0(x: f64) -> f64 {
@@ -140,12 +137,15 @@ impl<'a> Resampler<'a> {
         let taps_per_phase = TAPS_PER_PHASE;
         let filter_len = num_phases * taps_per_phase;
 
-        // Integer phase step (input samples consumed per output sample).
-        let step_f = (input_rate as f64 / output_rate as f64) * PHASE_ONE as f64;
-        if !(step_f >= 1.0 && step_f < u32::MAX as f64) {
+        // Integer tick periods keep the timing exact: the old Q24 step rounded
+        // 1/3 and produced an extra sample on the first 16 -> 48 kHz block.
+        // In the hot loop `pos < output_rate` whenever `pos + input_rate` or
+        // `pos * NUM_PHASES` is computed, so neither can overflow.
+        if input_rate.checked_add(output_rate).is_none()
+            || output_rate.checked_mul(NUM_PHASES).is_none()
+        {
             return Err(CodecError::InvalidInput);
         }
-        let step = fround(step_f) as u32;
 
         let coeffs = &mut coeffs[..filter_len];
 
@@ -191,13 +191,11 @@ impl<'a> Resampler<'a> {
         Ok(Self {
             input_rate,
             output_rate,
-            ratio,
             coeffs,
             taps_per_phase,
             history: [0; 2 * TAPS_PER_PHASE],
             w: TAPS_PER_PHASE,
             pos: 0,
-            step,
         })
     }
 
@@ -245,6 +243,11 @@ impl<'a> Resampler<'a> {
         let taps = self.taps_per_phase;
         let two_taps = 2 * taps;
         let mut written = 0usize;
+        // Tick periods (see `pos`): `step` per output, `interval` per input.
+        // Work on locals: a field would have to be kept up to date in memory
+        // at every possible early exit, a local can stay in a register.
+        let (step, interval) = (self.input_rate, self.output_rate);
+        let mut pos = self.pos;
 
         for &sample in input {
             // Compact the double buffer only once per `taps` inputs.
@@ -255,30 +258,34 @@ impl<'a> Resampler<'a> {
             self.history[self.w] = sample;
             self.w += 1;
 
-            if self.pos < PHASE_ONE {
+            // Emit every output that falls before the next input sample.
+            if pos < interval {
                 let base = self.w - taps;
                 let win: &[i16; TAPS_PER_PHASE] = self.history[base..base + taps]
                     .try_into()
                     .unwrap();
 
-                while self.pos < PHASE_ONE {
-                    // Top 8 bits of the fraction select the phase (0..=255).
-                    let phase_idx = (self.pos >> (PHASE_BITS - 8)) as usize;
+                while pos < interval {
+                    // Where the output falls between two input samples picks
+                    // the filter phase; only this choice is quantised.
+                    let phase_idx = pos * NUM_PHASES / interval;
                     let offset = phase_idx * taps;
                     let phase_coeffs: &[i16; TAPS_PER_PHASE] =
                         self.coeffs[offset..offset + taps].try_into().unwrap();
                     let out_sample = Self::dot_q15(win, phase_coeffs);
 
                     if written >= out.len() {
+                        self.pos = pos;
                         return Err(CodecError::BufferTooSmall);
                     }
                     out[written] = out_sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                     written += 1;
-                    self.pos += self.step;
+                    pos += step;
                 }
             }
-            self.pos -= PHASE_ONE;
+            pos -= interval;
         }
+        self.pos = pos;
 
         Ok(written)
     }
@@ -289,7 +296,10 @@ impl<'a> Resampler<'a> {
         if self.input_rate == self.output_rate {
             return n_input;
         }
-        ((n_input as f64 * self.ratio) as usize) + 1
+        // Outputs (`input_rate` ticks apart) that fit in `n_input` input
+        // periods (`output_rate` ticks each); the most fit when `pos == 0`.
+        let count = (n_input as u128 * self.output_rate as u128).div_ceil(self.input_rate as u128);
+        count.min(usize::MAX as u128) as usize
     }
 
     /// Convenience wrapper that allocates a `Vec` and calls `resample_into`.
@@ -409,6 +419,69 @@ mod tests {
         // Leak intentionally: tests are short-lived and we need a 'static reference.
         let coeffs: &'static mut [i16] = Box::leak(vec![0i16; COEFFS_LEN].into_boxed_slice());
         Resampler::new(input_rate, output_rate, coeffs).expect("resampler init")
+    }
+
+    #[test]
+    fn test_exact_sample_counts_for_repeated_20ms_blocks() {
+        for input_rate in [8000, 16000, 44100, 48000] {
+            for output_rate in [8000, 16000, 44100, 48000] {
+                let mut r = new_resampler(input_rate, output_rate);
+                let input = vec![1000; input_rate / 50];
+                let mut output = vec![0; output_rate / 50];
+                for block in 0..10 {
+                    let n = r.resample_into(&input, &mut output).unwrap_or_else(|e| {
+                        panic!("{input_rate} -> {output_rate}, block {block}: {e:?}")
+                    });
+                    assert_eq!(n, output.len(), "{input_rate} -> {output_rate}, block {block}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_exact_timing_survives_unaligned_chunks_and_reset() {
+        for (input_rate, output_rate) in [
+            (16000, 48000),
+            (48000, 16000),
+            (44100, 48000),
+            (48000, 44100),
+        ] {
+            let input: Vec<i16> = (0..2000).map(|i| ((i * 37 % 200) - 100) as i16).collect();
+            let mut r = new_resampler(input_rate, output_rate);
+            let expected = r.resample(&input);
+            assert_eq!(
+                expected.len(),
+                (input.len() * output_rate).div_ceil(input_rate)
+            );
+            r.reset();
+            let mut got = Vec::new();
+            let mut consumed = 0;
+            for chunk in input.chunks(7) {
+                got.extend(r.resample(chunk));
+                consumed += chunk.len();
+                assert_eq!(got.len(), (consumed * output_rate).div_ceil(input_rate));
+                assert!(r.resample(&[]).is_empty());
+            }
+            assert_eq!(got, expected, "{input_rate} -> {output_rate}");
+            r.reset();
+            assert_eq!(r.resample(&input), expected);
+        }
+    }
+
+    #[cfg(feature = "opus")]
+    #[test]
+    fn test_resampled_20ms_frames_encode_as_opus() {
+        use crate::{Encoder, opus::OpusEncoder};
+
+        for input_rate in [8000, 16000] {
+            let mut r = new_resampler(input_rate, 48000);
+            let mut encoder = OpusEncoder::new_default();
+            for _ in 0..3 {
+                let pcm = r.resample(&vec![0; input_rate / 50]);
+                assert_eq!(pcm.len(), 960);
+                assert!(!encoder.encode(&pcm).is_empty());
+            }
+        }
     }
 
     #[test]
@@ -560,25 +633,22 @@ mod tests {
         let input: Vec<i16> = (0..2000).map(|i| (((i * 37) % 200 - 100) * 60) as i16).collect();
         let got = r.resample(&input);
 
-        // f32 reference: same phase stepping, same Q15 coefficients.
+        // f32 reference: derive positions from the absolute output index,
+        // independently of the streaming accumulator, using the same Q15 taps.
         let taps = TAPS_PER_PHASE;
-        let step = ((fin as f64 / fout as f64) * PHASE_ONE as f64).round() as u32;
         let mut hist = [0.0f32; TAPS_PER_PHASE];
-        let mut pos = 0u32;
         let mut want = Vec::new();
-        for &s in &input {
+        for (input_index, &s) in input.iter().enumerate() {
             hist.copy_within(1..taps, 0);
             hist[taps - 1] = s as f32;
-            while pos < PHASE_ONE {
-                let phase = (pos >> (PHASE_BITS - 8)) as usize;
+            while want.len() * fin < (input_index + 1) * fout {
+                let phase = (want.len() * fin % fout) * NUM_PHASES / fout;
                 let mut acc = 0.0f32;
                 for t in 0..taps {
                     acc += hist[t] * (coeffs[phase * taps + t] as f32 / 32768.0);
                 }
                 want.push(acc.round().clamp(-32768.0, 32767.0) as i16);
-                pos += step;
             }
-            pos -= PHASE_ONE;
         }
 
         assert_eq!(got.len(), want.len());
@@ -615,7 +685,7 @@ mod tests {
         };
 
         let mut boxed = BoxedResampler::new(input_rate, output_rate).unwrap();
-        let expected_max = ((input.len() * output_rate + input_rate - 1) / input_rate) + 1;
+        let expected_max = (input.len() * output_rate).div_ceil(input_rate);
         assert_eq!(boxed.max_output_samples(input.len()), expected_max);
         let got = boxed.resample(&input);
         assert_eq!(
