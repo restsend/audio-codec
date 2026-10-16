@@ -1,6 +1,6 @@
 use std::hint::black_box;
 
-use audio_codec::{CodecType, create_decoder, create_encoder};
+use audio_codec::{CodecType, create_decoder, create_encoder, resampler, resampler_fixed};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 fn bench_codec(c: &mut Criterion) {
@@ -44,5 +44,35 @@ fn bench_codec(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_codec);
+fn bench_resampler(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Resampler");
+    for (from, to) in [
+        (48000, 8000),
+        (8000, 48000),
+        (16000, 8000),
+        (8000, 16000),
+        (16000, 48000),
+        (44100, 48000),
+    ] {
+        // 20ms of a sine tone
+        let input: Vec<i16> = (0..from / 50)
+            .map(|i| ((i as f32 * 0.05).sin() * 8000.0) as i16)
+            .collect();
+
+        let mut f32_core = resampler::BoxedResampler::new(from, to).unwrap();
+        let mut out = vec![0i16; f32_core.max_output_samples(input.len())];
+        group.bench_function(format!("f32_{from}_to_{to}_20ms"), |b| {
+            b.iter(|| f32_core.resample_into(black_box(&input), &mut out))
+        });
+
+        let mut q15_core = resampler_fixed::BoxedResampler::new(from, to).unwrap();
+        let mut out = vec![0i16; q15_core.max_output_samples(input.len())];
+        group.bench_function(format!("q15_{from}_to_{to}_20ms"), |b| {
+            b.iter(|| q15_core.resample_into(black_box(&input), &mut out))
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_codec, bench_resampler);
 criterion_main!(benches);

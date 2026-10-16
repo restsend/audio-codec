@@ -2,6 +2,8 @@
 name = "audio-codec"
 version = "0.4.11"
 edition = "2024"
+# fearless_simd 1.1 requires 1.89.
+rust-version = "1.89"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A collection of VoIP audio codecs in pure Rust, including G.711, G.722, G.729, and Opus."
 license = "MIT"
@@ -22,7 +24,11 @@ default = ["std", "opus", "g729"]
 # the caller's stack. OpusEncoder's inline state is ~250 KB without it, so
 # `OpusEncoder::new` alone could consume most of an 8 MB thread stack —
 # fatal for deep async call chains in debug builds.
-std = ["g729-sys?/std", "opus-rs?/std", "opus-rs?/heap"]
+#
+# `std` also enables fearless_simd's runtime CPU feature detection, so the
+# resamplers pick the best SIMD level available. Without it the SIMD level is
+# fixed at compile time (SSE2 on x86_64 unless `-C target-feature` says more).
+std = ["g729-sys?/std", "opus-rs?/std", "opus-rs?/heap", "fearless_simd/std"]
 # Opus support. On by default. opus-rs uses `libm` for transcendentals when
 # `std` is off (no_std build).
 opus = ["dep:opus-rs", "opus-rs/libm"]
@@ -37,6 +43,7 @@ crate-type = ["rlib"]
 g729-sys = { version = "0.2.1", optional = true, default-features = false }
 opus-rs = { version = "0.1.33", optional = true, default-features = false }
 libm = { version = "0.2", default-features = false }
+fearless_simd = { version = "1.1", default-features = false, features = ["libm"] }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
