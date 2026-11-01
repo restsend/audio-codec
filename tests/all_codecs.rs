@@ -163,7 +163,11 @@ fn pcmu_encoder_matches_canonical_g711() {
         let s = sample as i32 + BIAS;
         // exp_lut[(s >> 7) & 0xFF] == floor(log2(x)) for x >= 2, else 0.
         let x = ((s >> 7) & 0xFF) as u32;
-        let exponent: u8 = if x < 2 { 0 } else { (31 - x.leading_zeros()) as u8 };
+        let exponent: u8 = if x < 2 {
+            0
+        } else {
+            (31 - x.leading_zeros()) as u8
+        };
         let mantissa = ((s >> (exponent as i32 + 3)) & 0x0F) as u8;
         !(sign | (exponent << 4) | mantissa)
     }
@@ -190,6 +194,69 @@ fn pcmu_encoder_matches_canonical_g711() {
         mismatches, 0,
         "{mismatches}/65536 µ-law codes differ from canonical G.711"
     );
+}
+
+/// Issue #5 spec check: for every 16-bit input, encode -> decode must stay
+/// within **half a quantisation step** of the input.
+///
+/// The step size of the µ-law segment holding the input is `8 << segment`
+/// (`linear2ulaw_algo` clips to ±CLIP first, so the segment comes from the
+/// clipped value). Half a step therefore bounds the error of a correct
+/// encoder/decoder pair; the buggy pre-0.4.11 encoder mirrored codes inside
+/// segments 0-4 and missed this bound for ~93% of inputs.
+#[test]
+fn pcmu_roundtrip_within_half_quantization_step() {
+    const BIAS: i32 = 0x84;
+    const CLIP: i16 = 32635;
+
+    // Known-answer vectors from the issue report (standard G.711 column).
+    // The pre-0.4.11 encoder produced 0xE7 / 0xEC / 0xCD / 0xB6 / 0xFE here.
+    let mut enc = pcmu::PcmuEncoder::new();
+    let mut out = [0u8; 1];
+    for (sample, want) in [
+        (0i16, 0xFFu8),
+        (240, 0xE8),
+        (330, 0xE3),
+        (1000, 0xCE),
+        (3000, 0xB7),
+    ] {
+        enc.encode_into(&[sample], &mut out).expect("encode_into");
+        assert_eq!(out[0], want, "µ-law code for {sample}");
+    }
+
+    let mut dec = pcmu::PcmuDecoder::new();
+    let mut pcm = [0i16; 1];
+    let mut worst: (i32, i16) = (0, 0);
+    for i in 0..=u16::MAX {
+        let sample = i as i16;
+        let n = enc.encode_into(&[sample], &mut out).expect("encode_into");
+        assert_eq!(n, 1);
+        let n = dec.decode_into(&out, &mut pcm).expect("decode_into");
+        assert_eq!(n, 1);
+
+        // Segment of the (clipped) input: same loop as `linear2ulaw_algo`.
+        // |sample| beyond ±CLIP only loses the clip distance, so the bound
+        // applies to the clipped value.
+        let clipped = sample.clamp(-CLIP, CLIP);
+        let mut seg: u32 = 0;
+        let mut v = (clipped as i32).abs() + BIAS;
+        while v >= 256 {
+            seg += 1;
+            v >>= 1;
+        }
+        let half_step = 4i32 << seg;
+        let err = (pcm[0] as i32 - clipped as i32).abs();
+        assert!(
+            err <= half_step,
+            "µ-law round trip off by {err} (half step {half_step}) \
+             for sample {sample} -> {:#04x}",
+            out[0]
+        );
+        if err > worst.0 {
+            worst = (err, sample);
+        }
+    }
+    println!("PCMU half-step worst error: {worst:?}");
 }
 
 fn max_abs_err(a: &[i16], b: &[i16]) -> i32 {
