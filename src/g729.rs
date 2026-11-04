@@ -1,11 +1,19 @@
 use super::{CodecError, Decoder, Encoder, Sample};
+use crate::fade;
 
 const L_FRAME: usize = 80; // 10ms frame at 8kHz
 const L_FRAME_COMPRESSED: usize = 10; // G.729 frame size in bytes
+/// An Annex B SID frame, ending a payload after any speech frames
+/// (RFC 3551 §4.5.6).
+const L_SID: usize = 2;
 
 /// G.729 audio decoder using g729-sys
 pub struct G729Decoder {
     decoder: g729_sys::Decoder,
+    /// G.729's frame erasure concealment (§4.4) decays on its own but
+    /// settles some 30 dB down rather than at silence; it's faded on top
+    /// like the other codecs' (see [`crate::fade`]).
+    loss: fade::LossFade,
 }
 
 impl Default for G729Decoder {
@@ -19,6 +27,7 @@ impl G729Decoder {
     pub fn new() -> Self {
         Self {
             decoder: g729_sys::Decoder::new(),
+            loss: fade::LossFade::default(),
         }
     }
 }
@@ -32,27 +41,32 @@ impl Decoder for G729Decoder {
             return Ok(0);
         }
 
-        // G.729 processes 10-byte frames, each producing 80 samples
-        let mut written = 0usize;
-        let mut pos = 0usize;
-
-        while pos + L_FRAME_COMPRESSED <= data.len() {
-            if out.len() < written + L_FRAME {
-                return Err(CodecError::BufferTooSmall);
-            }
-            let frame_data = &data[pos..pos + L_FRAME_COMPRESSED];
-            // g729-sys: decode(frame, bfi, vad, dtx) -> [i16;80]
-            let decoded_frame = self.decoder.decode(frame_data, false, false, false);
-            out[written..written + L_FRAME].copy_from_slice(&decoded_frame);
-            written += L_FRAME;
-            pos += L_FRAME_COMPRESSED;
+        // 10-byte speech frames of 80 samples each, then possibly a SID
+        // frame, which decodes to 80 samples of comfort noise (Annex B)
+        if out.len() < self.max_decode_samples(data.len()) {
+            return Err(CodecError::BufferTooSmall);
         }
+        let mut written = 0usize;
+        let (frames, rest) = data.as_chunks::<L_FRAME_COMPRESSED>();
+        for frame in frames {
+            // g729-sys: decode(payload, frame_erased, is_sid, rfc3389)
+            let decoded = self.decoder.decode(frame, false, false, false);
+            out[written..written + L_FRAME].copy_from_slice(&decoded);
+            written += L_FRAME;
+        }
+        if rest.len() == L_SID {
+            let decoded = self.decoder.decode(rest, false, true, false);
+            out[written..written + L_FRAME].copy_from_slice(&decoded);
+            written += L_FRAME;
+        }
+        self.loss.end_loss(&mut out[..written], 1, 8000);
 
         Ok(written)
     }
 
     fn max_decode_samples(&self, n_bytes: usize) -> usize {
-        (n_bytes / L_FRAME_COMPRESSED) * L_FRAME
+        let sid = usize::from(n_bytes % L_FRAME_COMPRESSED == L_SID);
+        (n_bytes / L_FRAME_COMPRESSED + sid) * L_FRAME
     }
 
     fn sample_rate(&self) -> u32 {
@@ -61,6 +75,33 @@ impl Decoder for G729Decoder {
 
     fn channels(&self) -> u16 {
         1 // G.729 is always mono
+    }
+
+    /// G.729's concealment is part of the decoder: always on.
+    fn enable_concealment(&mut self) -> bool {
+        true
+    }
+
+    /// Conceals with G.729's frame erasure concealment (§4.4): the last
+    /// spectral envelope and pitch carry on with their gains attenuated,
+    /// the decoder's predictors kept in step, so the packets after the loss
+    /// decode close to what the sender encoded. In DTX, after a SID frame,
+    /// it carries on the comfort noise instead (Annex B). Faded through a
+    /// long loss like the other codecs: full level for 10 ms, silence at
+    /// 60 ms. `samples` must be a multiple of 80 (10 ms); others fail with
+    /// `InvalidInput`.
+    fn conceal_into(&mut self, samples: usize, out: &mut [Sample]) -> Result<usize, CodecError> {
+        if !samples.is_multiple_of(L_FRAME) {
+            return Err(CodecError::InvalidInput);
+        }
+        if out.len() < samples {
+            return Err(CodecError::BufferTooSmall);
+        }
+        for frame in out[..samples].as_chunks_mut::<L_FRAME>().0 {
+            *frame = self.decoder.decode(&[], true, false, false);
+        }
+        self.loss.fade(&mut out[..samples], 1, 8000);
+        Ok(samples)
     }
 }
 

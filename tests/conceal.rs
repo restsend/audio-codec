@@ -161,13 +161,151 @@ fn g722_recovers_after_a_long_loss() {
     );
 }
 
-#[cfg(feature = "g729")]
 #[test]
 fn decoders_without_concealment_write_nothing() {
-    let mut dec = create_decoder(CodecType::G729);
+    let mut dec = create_decoder(CodecType::TelephoneEvent);
     let mut out = [1i16; 80];
     assert_eq!(dec.conceal_into(80, &mut out), Ok(0));
     assert!(dec.conceal(80).is_empty());
+}
+
+/// Voiced, speech-like 8 kHz: 8 harmonics of a pitch gliding 120 → 180 Hz
+/// under a slow envelope, in 10 ms frames.
+#[cfg(feature = "g729")]
+fn voice_8k(frames: usize) -> Vec<Vec<i16>> {
+    let mut phase = 0f32;
+    let pcm: Vec<i16> = (0..frames * 80)
+        .map(|i| {
+            let t = i as f32 / 8000.0;
+            let f0 = 120.0 + 60.0 * (t / 0.6).min(1.0);
+            phase += 2.0 * std::f32::consts::PI * f0 / 8000.0;
+            let env = 0.6 + 0.4 * (2.0 * std::f32::consts::PI * 2.0 * t).sin();
+            let v: f32 = (1..=8).map(|k| (k as f32 * phase).sin() / k as f32).sum();
+            (6000.0 * env * v) as i16
+        })
+        .collect();
+    pcm.chunks(80).map(<[i16]>::to_vec).collect()
+}
+
+#[cfg(feature = "g729")]
+#[test]
+fn g729_conceals_with_its_own_erasure_concealment_faded() {
+    let mut enc = create_encoder(CodecType::G729);
+    let mut dec = create_decoder(CodecType::G729);
+    assert!(dec.enable_concealment());
+    for frame in voice_8k(30) {
+        dec.decode(&enc.encode(&frame));
+    }
+    // 80 ms lost, 10 ms at a time
+    let levels: Vec<f64> = (0..8).map(|_| rms(&dec.conceal(80))).collect();
+    assert!(levels[0] > 500.0, "concealment is silent: {levels:?}");
+    assert!(
+        levels[1] < levels[0] && levels[4] < levels[1],
+        "not fading: {levels:?}"
+    );
+    assert!(
+        levels[6..].iter().all(|l| *l == 0.0),
+        "not silent at 60 ms: {levels:?}"
+    );
+    // a 20 ms packet at once
+    assert_eq!(dec.conceal(160).len(), 160);
+}
+
+/// Concealing keeps G.729's predictors in step with the encoder's: the
+/// packets after a loss decode closer to a lossless decode than when the
+/// loss is skipped.
+#[cfg(feature = "g729")]
+#[test]
+fn g729_concealment_keeps_the_decoder_in_step() {
+    let mut enc = create_encoder(CodecType::G729);
+    let packets: Vec<Vec<u8>> = voice_8k(80).iter().map(|f| enc.encode(f)).collect();
+    let error_db = |conceal: bool| {
+        let (mut err, mut sig) = (0f64, 0f64);
+        for lost in (20..70).step_by(10) {
+            let mut clean = create_decoder(CodecType::G729);
+            let mut dec = create_decoder(CodecType::G729);
+            for p in &packets[..lost] {
+                clean.decode(p);
+                dec.decode(p);
+            }
+            for p in &packets[lost..lost + 2] {
+                clean.decode(p);
+                if conceal {
+                    dec.conceal(80);
+                }
+            }
+            for p in &packets[lost + 2..lost + 7] {
+                let (a, b) = (dec.decode(p), clean.decode(p));
+                err += a
+                    .iter()
+                    .zip(&b)
+                    .map(|(x, y)| (*x as f64 - *y as f64).powi(2))
+                    .sum::<f64>();
+                sig += b.iter().map(|y| (*y as f64).powi(2)).sum::<f64>();
+            }
+        }
+        10.0 * (err / sig).log10()
+    };
+    let (concealed, skipped) = (error_db(true), error_db(false));
+    println!("after a 20 ms loss: concealed {concealed:.1} dB, skipped {skipped:.1} dB");
+    // measured: concealed 0.6 dB, skipped 3.1 dB on this signal; on TTS
+    // speech, -3.7 dB and +5.0 dB
+    assert!(
+        concealed < skipped - 1.5,
+        "concealing no better than skipping: {concealed:.1} vs {skipped:.1} dB"
+    );
+}
+
+#[cfg(feature = "g729")]
+#[test]
+fn g729_sid_frames_decode_to_comfort_noise() {
+    use audio_codec::g729::{G729Decoder, G729Encoder};
+    use audio_codec::{Decoder, Encoder};
+    let mut enc = G729Encoder::with_vad(true);
+    let mut dec = G729Decoder::new();
+    let mut speech = 0f64;
+    let mut sid = None;
+    for (i, frame) in voice_8k(20)
+        .into_iter()
+        .chain((0..30).map(|_| vec![0i16; 80]))
+        .enumerate()
+    {
+        let payload = enc.encode(&frame);
+        let pcm = dec.decode(&payload);
+        if i < 20 {
+            speech = speech.max(rms(&pcm));
+        }
+        if payload.len() == 2 {
+            sid = Some(pcm);
+        }
+    }
+    let sid = sid.expect("no SID frame");
+    assert_eq!(sid.len(), 80, "a SID frame is 10 ms of comfort noise");
+    assert!(
+        rms(&sid) < speech / 10.0,
+        "{} vs speech {speech}",
+        rms(&sid)
+    );
+    assert_eq!(dec.max_decode_samples(2), 80);
+    assert_eq!(dec.max_decode_samples(12), 160);
+    assert_eq!(dec.max_decode_samples(20), 160);
+}
+
+#[cfg(feature = "g729")]
+#[test]
+fn g729_conceals_10_ms_at_a_time_and_from_nothing() {
+    let mut dec = create_decoder(CodecType::G729);
+    let mut out = [0i16; 160];
+    assert_eq!(
+        dec.conceal_into(100, &mut out),
+        Err(audio_codec::CodecError::InvalidInput)
+    );
+    assert_eq!(
+        dec.conceal_into(160, &mut out[..80]),
+        Err(audio_codec::CodecError::BufferTooSmall)
+    );
+    // before any audio: whatever the decoder's initial state gives, faded
+    assert_eq!(dec.conceal_into(160, &mut out), Ok(160));
 }
 
 /// Without enabling, or without the `plc` feature, G.711 and G.722 leave

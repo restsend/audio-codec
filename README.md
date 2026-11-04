@@ -22,7 +22,7 @@ A collection of VoIP audio codecs implemented for Rust. This crate provides a un
 - **Resampler**: Built-in audio resampling utility.
 - **Packet loss concealment**: `Decoder::conceal_into` fills in for a lost
   packet, `Decoder::recover_into` rebuilds it from Opus in-band FEC. Opus
-  uses its own concealment; G.711 and G.722 get pitch-repetition
+  and G.729 use their own concealment; G.711 and G.722 get pitch-repetition
   concealment (G.711 Appendix I style), with G.722's ADPCM state carried
   through the loss, behind the `plc` feature and `enable_concealment()`.
   `CodecType::is_silence_frame` tells DTX silence from loss.
@@ -152,8 +152,16 @@ fn main() {
   Enabling it boxes a ~1.7 KB history per decoder and copies each decoded
   packet into it; with the `plc` feature off, or not enabled, the decoders
   are unchanged.
-- **G.729** and **Telephone Event** have none: `conceal_into` returns
-  `Ok(0)` and the caller conceals the gap itself.
+- **G.729** uses its own frame erasure concealment (G.729 §4.4), always
+  available: the last spectral envelope and pitch carry on with their
+  gains attenuated, and the decoder's predictors stay in step, so the
+  packets after the loss decode close to what the sender encoded (skipping
+  the gap instead leaves them with more error than signal for the next
+  50 ms or so). It's faded like the others, and in DTX, after a SID frame,
+  it carries on the comfort noise. SID frames (Annex B) decode to 10 ms of
+  comfort noise. `conceal_into` takes multiples of 10 ms.
+- **Telephone Event** has none: `conceal_into` returns `Ok(0)` and the
+  caller conceals the gap itself.
 
 Not every missing packet is lost: a sender in discontinuous transmission
 (DTX) goes quiet with a silence frame and sends nothing more until speech

@@ -8,7 +8,7 @@ extern crate alloc;
 pub use error::CodecError;
 
 pub mod error;
-#[cfg(any(feature = "plc", feature = "opus"))]
+#[cfg(any(feature = "plc", feature = "opus", feature = "g729"))]
 mod fade;
 pub mod g722;
 #[cfg(feature = "g729")]
@@ -75,8 +75,8 @@ pub trait Decoder: Send + Sync {
     /// [`Decoder::conceal_into`] will conceal. Off by default where keeping
     /// it ready costs something on every decoded packet: G.711 and G.722
     /// keep a history of the decoded audio, and have concealment only with
-    /// the `plc` feature. Opus's is part of the decoder and always on. The
-    /// default returns `false`: no concealment.
+    /// the `plc` feature. Opus's and G.729's are part of the decoder and
+    /// always on. The default returns `false`: no concealment.
     fn enable_concealment(&mut self) -> bool {
         false
     }

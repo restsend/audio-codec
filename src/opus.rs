@@ -1,7 +1,9 @@
 #[cfg(feature = "std")]
 use super::PcmBuf;
 use super::{CodecError, Decoder, Encoder, Sample};
-use crate::fade::{self, RECOVER_MS};
+use crate::fade;
+#[cfg(test)]
+use crate::fade::RECOVER_MS;
 // `Box` lives in the std prelude; under `no_std` it comes from `alloc`.
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
@@ -23,10 +25,9 @@ pub struct OpusDecoder {
     channels: u16,
     w_output_f32: [f32; OPUS_MAX_SAMPLES],
     w_pcm_i16: [i16; OPUS_MAX_SAMPLES],
-    /// Samples per channel concealed in the current loss; 0 when not
-    /// concealing. Opus's concealment carries on near the level of the
-    /// audio before the loss, so it's faded here (see [`crate::fade`]).
-    concealed: usize,
+    /// Opus's concealment carries on near the level of the audio before
+    /// the loss, so it's faded here (see [`crate::fade`]).
+    loss: fade::LossFade,
 }
 
 impl OpusDecoder {
@@ -43,7 +44,7 @@ impl OpusDecoder {
             channels,
             w_output_f32: [0.0; OPUS_MAX_SAMPLES],
             w_pcm_i16: [0; OPUS_MAX_SAMPLES],
-            concealed: 0,
+            loss: fade::LossFade::default(),
         }
     }
 
@@ -69,7 +70,7 @@ impl OpusDecoder {
             // Reuse the existing heap allocation (see `clippy::replace_box`).
             *self.decoder = OpusDecoderRaw::new(self.sample_rate as i32, packet_channels)
                 .expect("Failed to create Opus decoder");
-            self.concealed = 0;
+            self.loss.clear();
         }
 
         let channels = usize::from(self.channels);
@@ -96,7 +97,8 @@ impl OpusDecoder {
                 // a DTX frame (the TOC byte alone) is the decoder's comfort
                 // noise, not the end of a loss
                 if data.len() > 1 {
-                    self.end_loss(&mut output[..n], channels);
+                    self.loss
+                        .end_loss(&mut output[..n], channels, self.sample_rate);
                 }
                 n
             }
@@ -139,45 +141,12 @@ impl OpusDecoder {
             // rebuilt from the sender's own data: audio like a decoded
             // packet's (where `next` carried no FEC, the frame is concealed
             // at full level, as the first of a loss would be)
-            Some(_) => self.end_loss(&mut out[..n], channels),
-            None => self.fade(&mut out[..n], channels),
+            Some(_) => self
+                .loss
+                .end_loss(&mut out[..n], channels, self.sample_rate),
+            None => self.loss.fade(&mut out[..n], channels, self.sample_rate),
         }
         Ok(n)
-    }
-
-    /// Fade a concealed frame by how far into the loss it is.
-    fn fade(&mut self, out: &mut [Sample], channels: usize) {
-        let channels = channels.max(1);
-        for (i, frame) in out.chunks_mut(channels).enumerate() {
-            let gain = fade::gain(self.concealed + i, self.sample_rate);
-            for s in frame {
-                *s = (*s as i32 * gain / 100) as Sample;
-            }
-        }
-        self.concealed += out.len() / channels;
-    }
-
-    /// Bring decoded audio ending a loss back in from where the fade had
-    /// got to, over `RECOVER_MS`.
-    fn end_loss(&mut self, out: &mut [Sample], channels: usize) {
-        if self.concealed == 0 {
-            return;
-        }
-        let from = fade::gain(self.concealed, self.sample_rate);
-        self.concealed = 0;
-        if from >= 100 {
-            return;
-        }
-        let channels = channels.max(1);
-        let len = (self.sample_rate * RECOVER_MS / 1000) as usize;
-        let total = (len + 1) as i32;
-        for (i, frame) in out.chunks_mut(channels).take(len).enumerate() {
-            let w = (i + 1) as i32;
-            let gain = from + (100 - from) * w / total;
-            for s in frame {
-                *s = (*s as i32 * gain / 100) as Sample;
-            }
-        }
     }
 
     /// `conceal_into_raw` with the stereo→mono downmix `decode` does.
@@ -632,7 +601,7 @@ mod tests {
         assert_eq!(resumed[ramp..], expected[ramp..]);
         // the loss is over: the next one starts at full level
         dec.conceal(960);
-        assert_eq!(dec.concealed, 960);
+        assert_eq!(dec.loss.concealed(), 960);
     }
 
     #[test]
