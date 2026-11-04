@@ -25,6 +25,7 @@ A collection of VoIP audio codecs implemented for Rust. This crate provides a un
   uses its own concealment; G.711 and G.722 get pitch-repetition
   concealment (G.711 Appendix I style), with G.722's ADPCM state carried
   through the loss, behind the `plc` feature and `enable_concealment()`.
+  `CodecType::is_silence_frame` tells DTX silence from loss.
 
 ## Performance
 
@@ -153,6 +154,12 @@ fn main() {
   are unchanged.
 - **G.729** and **Telephone Event** have none: `conceal_into` returns
   `Ok(0)` and the caller conceals the gap itself.
+
+Not every missing packet is lost: a sender in discontinuous transmission
+(DTX) goes quiet with a silence frame and sends nothing more until speech
+resumes. `CodecType::is_silence_frame(payload)` tells those apart (Opus
+DTX packets, G.729 Annex B SID frames), so a jitter buffer can play the
+silence that follows as silence instead of concealing it.
 
 ## `no_std` support
 

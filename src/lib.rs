@@ -338,6 +338,31 @@ impl CodecType {
         }
     }
 
+    /// Whether `payload` says the sender went quiet: it is, or ends with,
+    /// the codec's silence frame under discontinuous transmission (DTX).
+    /// A sender in DTX then sends nothing, or only more of these, until
+    /// speech resumes, so a jitter buffer should take the frames missing
+    /// after one as silence rather than loss, and not conceal them.
+    ///
+    /// - Opus: a DTX packet, at most 2 bytes (as WebRTC tells them apart).
+    /// - G.729: a payload ending with an Annex B SID frame, 2 bytes after
+    ///   any 10-byte speech frames (RFC 3551 §4.5.6).
+    /// - Others have no DTX of their own: `false`. Comfort noise sent in its
+    ///   own payload type (RFC 3389 `CN`, static payload type 13) means the
+    ///   same, but isn't a codec here: check for it by payload type.
+    pub fn is_silence_frame(&self, payload: &[u8]) -> bool {
+        match self {
+            #[cfg(feature = "opus")]
+            CodecType::Opus => !payload.is_empty() && payload.len() <= 2,
+            #[cfg(feature = "g729")]
+            CodecType::G729 => payload.len() % 10 == 2,
+            _ => {
+                let _ = payload;
+                false
+            }
+        }
+    }
+
     pub fn is_dynamic(&self) -> bool {
         match self {
             #[cfg(feature = "opus")]
