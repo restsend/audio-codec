@@ -135,11 +135,14 @@ fn main() {
 }
 ```
 
-- **Opus** uses its own concealment, always available. With the packet
-  after the loss already at hand, `recover_into(next, ..)` (or `recover`)
-  rebuilds the lost one from its in-band FEC instead, where the sender
-  coded it (`OpusEncoder::set_inband_fec` with `set_packet_loss_perc`);
-  for other codecs it conceals.
+- **Opus** uses its own concealment, always available, faded through a
+  long loss like G.711's (full level for 10 ms, silence at 60 ms): on its
+  own it carries on near the level of the audio before the loss. The next
+  packet decoded is ramped back in. With the packet after the loss already
+  at hand, `recover_into(next, ..)` (or `recover`) rebuilds the lost one
+  from its in-band FEC instead, where the sender coded it
+  (`OpusEncoder::set_inband_fec` with `set_packet_loss_perc`); for other
+  codecs it conceals.
 - **G.711 / G.722** repeat the last pitch period of the decoded audio,
   continuing the waveform, fading to silence 60 ms into a loss, and
   crossfade into the next decoded packet. G.722 also carries its ADPCM
