@@ -1,6 +1,7 @@
 #[cfg(feature = "std")]
 use super::PcmBuf;
 use super::{CodecError, Decoder, Encoder, Sample};
+use crate::fade::{self, RECOVER_MS};
 // `Box` lives in the std prelude; under `no_std` it comes from `alloc`.
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
@@ -22,6 +23,10 @@ pub struct OpusDecoder {
     channels: u16,
     w_output_f32: [f32; OPUS_MAX_SAMPLES],
     w_pcm_i16: [i16; OPUS_MAX_SAMPLES],
+    /// Samples per channel concealed in the current loss; 0 when not
+    /// concealing. Opus's concealment carries on near the level of the
+    /// audio before the loss, so it's faded here (see [`crate::fade`]).
+    concealed: usize,
 }
 
 impl OpusDecoder {
@@ -38,6 +43,7 @@ impl OpusDecoder {
             channels,
             w_output_f32: [0.0; OPUS_MAX_SAMPLES],
             w_pcm_i16: [0; OPUS_MAX_SAMPLES],
+            concealed: 0,
         }
     }
 
@@ -63,6 +69,7 @@ impl OpusDecoder {
             // Reuse the existing heap allocation (see `clippy::replace_box`).
             *self.decoder = OpusDecoderRaw::new(self.sample_rate as i32, packet_channels)
                 .expect("Failed to create Opus decoder");
+            self.concealed = 0;
         }
 
         let channels = usize::from(self.channels);
@@ -86,6 +93,11 @@ impl OpusDecoder {
 
                 let n = total_samples.min(output.len());
                 output[..n].copy_from_slice(&self.w_pcm_i16[..n]);
+                // a DTX frame (the TOC byte alone) is the decoder's comfort
+                // noise, not the end of a loss
+                if data.len() > 1 {
+                    self.end_loss(&mut output[..n], channels);
+                }
                 n
             }
             Err(_) => 0,
@@ -123,7 +135,49 @@ impl OpusDecoder {
         for (o, f) in out[..n].iter_mut().zip(&self.w_output_f32[..n]) {
             *o = (f * 32768.0).clamp(-32768.0, 32767.0) as i16;
         }
+        match next {
+            // rebuilt from the sender's own data: audio like a decoded
+            // packet's (where `next` carried no FEC, the frame is concealed
+            // at full level, as the first of a loss would be)
+            Some(_) => self.end_loss(&mut out[..n], channels),
+            None => self.fade(&mut out[..n], channels),
+        }
         Ok(n)
+    }
+
+    /// Fade a concealed frame by how far into the loss it is.
+    fn fade(&mut self, out: &mut [Sample], channels: usize) {
+        let channels = channels.max(1);
+        for (i, frame) in out.chunks_mut(channels).enumerate() {
+            let gain = fade::gain(self.concealed + i, self.sample_rate);
+            for s in frame {
+                *s = (*s as i32 * gain / 100) as Sample;
+            }
+        }
+        self.concealed += out.len() / channels;
+    }
+
+    /// Bring decoded audio ending a loss back in from where the fade had
+    /// got to, over `RECOVER_MS`.
+    fn end_loss(&mut self, out: &mut [Sample], channels: usize) {
+        if self.concealed == 0 {
+            return;
+        }
+        let from = fade::gain(self.concealed, self.sample_rate);
+        self.concealed = 0;
+        if from >= 100 {
+            return;
+        }
+        let channels = channels.max(1);
+        let len = (self.sample_rate * RECOVER_MS / 1000) as usize;
+        let total = (len + 1) as i32;
+        for (i, frame) in out.chunks_mut(channels).take(len).enumerate() {
+            let w = (i + 1) as i32;
+            let gain = from + (100 - from) * w / total;
+            for s in frame {
+                *s = (*s as i32 * gain / 100) as Sample;
+            }
+        }
     }
 
     /// `conceal_into_raw` with the stereo→mono downmix `decode` does.
@@ -150,9 +204,10 @@ impl Decoder for OpusDecoder {
         true
     }
 
-    /// Conceals with Opus's own packet loss concealment. `samples` must be
-    /// an Opus frame size (a multiple of 2.5 ms, at most 20 ms); others
-    /// fail with `DecodeFailed`.
+    /// Conceals with Opus's own packet loss concealment, faded through a
+    /// long loss as G.711 and G.722's is: full level for 10 ms, silence at
+    /// 60 ms. `samples` must be an Opus frame size (a multiple of 2.5 ms, at
+    /// most 20 ms); others fail with `DecodeFailed`.
     fn conceal_into(&mut self, samples: usize, out: &mut [Sample]) -> Result<usize, CodecError> {
         self.conceal_into_raw(None, samples, out)
     }
@@ -526,6 +581,58 @@ mod tests {
             recovered_db < concealed_db - 4.0,
             "FEC no better than concealment: {recovered_db:.1} vs {concealed_db:.1} dB"
         );
+    }
+
+    #[test]
+    fn test_opus_concealment_fades_through_a_long_loss() {
+        let mut enc = OpusEncoder::new(48000, 1);
+        let packets: Vec<Vec<u8>> = voice(12).iter().map(|f| enc.encode(f)).collect();
+        let mut dec = OpusDecoder::new(48000, 1);
+        for p in &packets[..10] {
+            dec.decode(p);
+        }
+        let levels: Vec<f64> = (0..5).map(|_| rms(&dec.conceal(960))).collect();
+        // full for 10 ms, then 20% per 10 ms: silent from 60 ms
+        assert!(
+            levels[0] > 500.0,
+            "first frame of a loss is audible: {levels:?}"
+        );
+        assert!(
+            levels[1] < levels[0] && levels[2] < levels[1],
+            "not fading: {levels:?}"
+        );
+        assert_eq!(levels[3..], [0.0, 0.0], "not silent from 60 ms: {levels:?}");
+    }
+
+    #[test]
+    fn test_opus_decoding_after_a_faded_loss_ramps_in() {
+        let mut enc = OpusEncoder::new(48000, 1);
+        let packets: Vec<Vec<u8>> = voice(12).iter().map(|f| enc.encode(f)).collect();
+        let mut dec = OpusDecoder::new(48000, 1);
+        // opus-rs on its own, given the same calls
+        let mut raw = OpusDecoderRaw::new(48000, 1).unwrap();
+        let mut raw_out = [0f32; 960];
+        for p in &packets[..10] {
+            dec.decode(p);
+            raw.decode(p, 960, &mut raw_out).unwrap();
+        }
+        for _ in 0..5 {
+            dec.conceal(960);
+            raw.decode(&[], 960, &mut raw_out).unwrap();
+        }
+        let resumed = dec.decode(&packets[10]);
+        raw.decode(&packets[10], 960, &mut raw_out).unwrap();
+        let expected: Vec<i16> = raw_out
+            .iter()
+            .map(|f| (f * 32768.0).clamp(-32768.0, 32767.0) as i16)
+            .collect();
+        // from silence over 4 ms, then as decoded
+        let ramp = 48000 * RECOVER_MS as usize / 1000;
+        assert!(resumed[0].unsigned_abs() <= expected[0].unsigned_abs() / 100 + 1);
+        assert_eq!(resumed[ramp..], expected[ramp..]);
+        // the loss is over: the next one starts at full level
+        dec.conceal(960);
+        assert_eq!(dec.concealed, 960);
     }
 
     #[test]

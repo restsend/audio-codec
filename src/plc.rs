@@ -8,25 +8,20 @@
 //! with the last audio played, by holding output back 3.75 ms; this plays
 //! without delay, so that seam is only as smooth as the pitch estimate.)
 //!
-//! Long losses fade out: the first 10 ms play at full level, then the level
-//! drops by 20% per 10 ms, reaching silence 60 ms in. The first frame
-//! decoded after a loss is crossfaded with the continued repetition.
+//! Long losses fade out as Appendix I has it (see [`crate::fade`]): full
+//! level for 10 ms, silence at 60 ms. The first frame decoded after a loss
+//! is crossfaded with the continued repetition.
 //!
 //! Heap-free: the history is a fixed array sized for 16 kHz.
 
 use super::Sample;
+use crate::fade::{self, RECOVER_MS};
 
 /// Pitch range searched, in Hz (as in G.711 Appendix I).
 const MIN_PITCH_HZ: u32 = 66;
 const MAX_PITCH_HZ: u32 = 200;
 /// Window correlated when estimating the pitch.
 const CORR_MS: u32 = 20;
-/// Concealment plays at full level for this long, then fades.
-const FULL_LEVEL_MS: u32 = 10;
-/// Gain lost per 10 ms after `FULL_LEVEL_MS`, in percent; silence at 60 ms.
-const FADE_PERCENT_PER_10MS: u32 = 20;
-/// Crossfade into the first decoded frame after a loss.
-const RECOVER_MS: u32 = 4;
 
 /// Highest sample rate the fixed buffers are sized for.
 const MAX_RATE: u32 = 16000;
@@ -174,12 +169,7 @@ impl PitchConcealer {
 
     /// Gain in percent, `t` samples into a loss.
     fn gain(&self, t: usize) -> i32 {
-        let full = self.ms(FULL_LEVEL_MS);
-        if t < full {
-            return 100;
-        }
-        let faded = (t - full) * FADE_PERCENT_PER_10MS as usize / self.ms(10).max(1);
-        100 - faded.min(100) as i32
+        fade::gain(t, self.rate)
     }
 
     /// The repetition `k` samples past the last one extrapolated, without

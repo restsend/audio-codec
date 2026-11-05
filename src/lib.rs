@@ -8,6 +8,8 @@ extern crate alloc;
 pub use error::CodecError;
 
 pub mod error;
+#[cfg(any(feature = "plc", feature = "opus"))]
+mod fade;
 pub mod g722;
 #[cfg(feature = "g729")]
 pub mod g729;
@@ -83,7 +85,8 @@ pub trait Decoder: Send + Sync {
     /// to play in its place into `out`, returning the number written
     /// (`samples * channels`). The decoder's state carries on through the
     /// loss as the codec allows, and the next packet decoded after it is
-    /// blended in.
+    /// blended in. A long loss fades out: full level for 10 ms, silence at
+    /// 60 ms (after G.711 Appendix I).
     ///
     /// Call it once per lost packet, in order, between the `decode_into`
     /// calls of the packets around the loss. Returns `Ok(0)`, writing
