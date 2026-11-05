@@ -12,6 +12,7 @@ const FADE_PERCENT_PER_10MS: u32 = 20;
 /// Blend into the first decoded frame after a loss.
 pub(crate) const RECOVER_MS: u32 = 4;
 
+#[cfg(any(feature = "opus", feature = "g729"))]
 use crate::Sample;
 
 /// Gain in percent, `t` samples (per channel, at `rate`) into a loss.
@@ -27,6 +28,7 @@ pub(crate) fn gain(t: usize, rate: u32) -> i32 {
 
 /// Where a decoder is in a loss, to fade its own concealment by and to
 /// bring the audio after it back in.
+#[cfg(any(feature = "opus", feature = "g729"))]
 #[derive(Debug, Default)]
 pub(crate) struct LossFade {
     /// Samples per channel concealed in the current loss; 0 when not
@@ -34,6 +36,7 @@ pub(crate) struct LossFade {
     concealed: usize,
 }
 
+#[cfg(any(feature = "opus", feature = "g729"))]
 impl LossFade {
     /// Fade a concealed frame (interleaved, `channels`) by how far into the
     /// loss it is.
@@ -78,7 +81,7 @@ impl LossFade {
     }
 
     /// Samples per channel concealed in the current loss.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "opus"))]
     pub(crate) fn concealed(&self) -> usize {
         self.concealed
     }

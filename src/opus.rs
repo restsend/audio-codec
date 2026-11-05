@@ -755,7 +755,6 @@ mod tests {
 #[cfg(all(test, feature = "opus"))]
 mod no_std_tests {
     use super::*;
-    use alloc::vec;
     use alloc::vec::Vec;
 
     #[test]

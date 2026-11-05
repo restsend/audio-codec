@@ -146,6 +146,7 @@ fn music(sr: u32) -> Vec<i16> {
 }
 
 /// Monophonic melody (speech-like, for G.729).
+#[cfg(feature = "g729")]
 fn mono_music(sr: u32) -> Vec<i16> {
     build(sr, false)
 }

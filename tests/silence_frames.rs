@@ -3,9 +3,12 @@
 
 #![cfg(feature = "std")]
 
-use audio_codec::{CodecType, Encoder};
+use audio_codec::CodecType;
+#[cfg(any(feature = "g729", feature = "opus"))]
+use audio_codec::Encoder;
 
 /// 10 ms frames at `rate` of a tone, then digital silence.
+#[cfg(any(feature = "g729", feature = "opus"))]
 fn tone_then_silence(rate: u32, frame_ms: u32, tone: usize, silence: usize) -> Vec<Vec<i16>> {
     let n = (rate * frame_ms / 1000) as usize;
     (0..tone + silence)

@@ -13,10 +13,12 @@ fn tone(rate: u32, frame_len: usize, frame: usize) -> Vec<i16> {
         .collect()
 }
 
+#[cfg(any(feature = "plc", feature = "g729"))]
 fn rms(s: &[i16]) -> f64 {
     (s.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / s.len() as f64).sqrt()
 }
 
+#[cfg(feature = "plc")]
 fn max_step(s: &[i16]) -> i32 {
     s.windows(2)
         .map(|w| (w[1] as i32 - w[0] as i32).abs())
